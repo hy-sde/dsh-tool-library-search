@@ -1,0 +1,44 @@
+# @hy-sde-org/dsh-tool-library-search — a model-facing "has this already been
+# built?" library search tool.
+#
+# The plugin mounts as ONE plain agent-plane row, like the harness's own tool
+# rows: it consumes the deployment's host services `tools` and `systemPrompt`
+# (stock base provides both via the agent bundle), so it needs no service or
+# filesystem realm of its own. Each `library_search` call fans the query out
+# to the free registry search APIs over the network (deps.dev, npm, crates.io,
+# GitHub) — no API key or fetch provider is required.
+#
+# The row id carries the `hy-sde-` prefix to avoid clashing with any shipped
+# row of the same name (a duplicate loader id fails the boot); if the
+# deployment already mounts a `tool-library-search` row of its own, disable
+# this one or drop the insert and keep the stock row.
+#
+# Override per deployment (e.g. add a GitHub token to raise the repo-search
+# quota from 10/min to 30/min) by patching the row by id:
+#
+#   - id: hy-sde-libsearch-tool-library-search
+#     config:
+#       githubToken: ghp_xxx
+#       timeoutMs: 12000
+#       maxResults: 20
+#       semantic: false   # disable the semantic rerank layer
+#
+# Token-aware paging: with a GitHub token set, raising `perSourceLimit` above
+# 100 walks `page=` links (≤5 pages, each = 1 of the 30/min searches), so the
+# semantic rerank gets a deeper star-sorted pool, e.g. perSourceLimit: 300.
+#
+# `semantic: true` embeds the query + candidate READMEs locally (all-MiniLM-L6-v2
+# via the OPTIONAL peer @huggingface/transformers, ~25 MB one-time download, no
+# key). Without that peer the tool still answers with lexical ranking and notes
+# that the rerank was unavailable, so enabling it here is safe.
+#
+# The `library:search` prompt section is registered by the same plugin, so no
+# separate prompt row is needed.
+- insert:
+    - id: hy-sde-libsearch-tool-library-search
+      name: '@hy-sde-org/dsh-tool-library-search'
+      config:
+        timeoutMs: 12000
+        maxResults: 20
+        perSourceLimit: 8
+        semantic: true

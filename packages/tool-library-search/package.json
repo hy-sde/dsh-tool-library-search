@@ -1,0 +1,115 @@
+{
+  "name": "@hy-sde-org/dsh-tool-library-search",
+  "description": "Model-facing library_search tool: free cross-ecosystem (npm/crates.io/Maven/Go/PyPI/RubyGems + GitHub) 'has this already been built?' search — exact-name ranked, stars/downloads as fitness signals, no API key required",
+  "version": "0.1.0-rc.1",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hy-sde/dsh-plugins.git",
+    "directory": "dsh-tool-library-search/packages/tool-library-search"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./candidates": {
+      "types": "./dist/candidates.d.ts",
+      "default": "./dist/candidates.js"
+    },
+    "./library-search": {
+      "types": "./dist/library-search.d.ts",
+      "default": "./dist/library-search.js"
+    },
+    "./tool": {
+      "types": "./dist/tool.d.ts",
+      "default": "./dist/tool.js"
+    },
+    "./prompt": {
+      "types": "./dist/prompt.d.ts",
+      "default": "./dist/prompt.js"
+    },
+    "./sources/http": {
+      "types": "./dist/sources/http.d.ts",
+      "default": "./dist/sources/http.js"
+    },
+    "./sources/pkggodev": {
+      "types": "./dist/sources/pkggodev.d.ts",
+      "default": "./dist/sources/pkggodev.js"
+    },
+    "./readme": {
+      "types": "./dist/readme.d.ts",
+      "default": "./dist/readme.js"
+    },
+    "./semantic": {
+      "types": "./dist/semantic.d.ts",
+      "default": "./dist/semantic.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "README.i18n.yaml",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepack": "pnpm run clean && pnpm run build"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1",
+    "@huggingface/transformers": ">=3.7.1 <5"
+  },
+  "peerDependenciesMeta": {
+    "@huggingface/transformers": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1",
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "keywords": [
+    "deepseek",
+    "agent",
+    "harness",
+    "dsh-plugin",
+    "library-search",
+    "registry-search",
+    "npm",
+    "crates",
+    "maven",
+    "github",
+    "semantic-search",
+    "tool"
+  ]
+}
