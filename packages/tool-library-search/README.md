@@ -1,8 +1,3 @@
----
-description: "Model-facing library_search tool that answers 'has this already been built?' across npm, crates.io, Maven, Go, PyPI, RubyGems, and GitHub — free no-key APIs, exact-name ranked, stars/downloads as fitness signals."
-kind: "package-reference"
----
-
 # @hy-sde-org/dsh-tool-library-search
 
 English | [中文](README.zh.md)

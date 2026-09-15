@@ -1,8 +1,3 @@
----
-description: "模型可调用的 library_search 工具：跨 npm、crates.io、Maven、Go、PyPI、RubyGems 与 GitHub 回答『这个库是不是已经有人做过了?』——全部使用免费的免密钥 API，精确名称优先排序，star/下载量作为活跃度信号。"
-kind: "package-reference"
----
-
 # @hy-sde-org/dsh-tool-library-search
 
 [English](README.md) | 中文
