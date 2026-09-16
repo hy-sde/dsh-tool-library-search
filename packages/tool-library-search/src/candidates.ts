@@ -162,7 +162,7 @@ export function mergeCandidates(hits: readonly Candidate[]): Candidate[] {
         ecosystem: hit.ecosystem,
         kind: hit.kind,
         link: hit.link,
-        ...(hit.description !== undefined ? { description: hit.description } : {}),
+        ...(hit.description != null ? { description: hit.description } : {}),
         ...(hit.version !== undefined ? { version: hit.version } : {}),
         ...(hit.stars !== undefined ? { stars: hit.stars } : {}),
         ...(hit.downloads !== undefined ? { downloads: hit.downloads } : {}),
@@ -173,7 +173,7 @@ export function mergeCandidates(hits: readonly Candidate[]): Candidate[] {
       continue
     }
     // Keep the longest description (most informative), first-seen otherwise.
-    if (hit.description !== undefined && (merged.description === undefined || hit.description.length > merged.description.length)) {
+    if (hit.description != null && (merged.description === undefined || hit.description.length > merged.description.length)) {
       merged.description = hit.description
     }
     if (hit.stars !== undefined && hit.stars > (merged.stars ?? 0)) merged.stars = hit.stars

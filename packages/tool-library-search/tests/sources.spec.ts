@@ -117,6 +117,15 @@ describe('searchGithub', () => {
     expect(result[0]).toMatchObject({ name: 'saphyr-rs/saphyr', ecosystem: 'github', stars: 336, repository: 'saphyr-rs/saphyr' })
   })
 
+  it('drops repos whose description is null (GitHub omits descriptions for some repos)', async () => {
+    const fetcher: Fetcher = async () => new Response(JSON.stringify({
+      items: [{ full_name: 'owner/no-desc', html_url: 'https://github.com/owner/no-desc', description: null, stargazers_count: 5 }],
+    }), { status: 200 })
+    const result = await searchGithub('patchright', { timeoutMs: 5000, userAgent: 't', fetch: fetcher }, 5)
+    expect(result[0]?.name).toBe('owner/no-desc')
+    expect(result[0]?.description).toBeUndefined()
+  })
+
   it('never pages without a token (one request regardless of the limit)', async () => {
     const urls: string[] = []
     const fetcher: Fetcher = async (url) => {

@@ -163,6 +163,15 @@ describe('rankCandidates — exact name beats popularity', () => {
     expect(ranked[0]?.name).toBe('saphyr-rs/saphyr')
   })
 
+  it('mergeCandidates survives a null description without crashing', () => {
+    const candidates: Candidate[] = [
+      { name: 'owner/no-desc', ecosystem: 'github', kind: 'project', link: 'u', description: null as unknown as string, sources: ['github'] },
+    ]
+    const merged = mergeCandidates(candidates)
+    expect(merged).toHaveLength(1)
+    expect(merged[0]?.description).toBeUndefined()
+  })
+
   it('uses cross-source consensus as a small co-signal tiebreak', () => {
     const candidates: Candidate[] = [
       { name: 'serde_yaml', ecosystem: 'cargo', kind: 'package', link: 'u', sources: ['crates.io'] },

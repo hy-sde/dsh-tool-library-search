@@ -107,7 +107,7 @@ export async function searchLibraries(
     throw new Error(`all library-search sources failed: ${failures.join('; ')}`)
   }
 
-  const clipped = hits.map(hit => hit.description !== undefined && hit.description.length > MAX_DESCRIPTION_CHARS
+  const clipped = hits.map(hit => hit.description != null && hit.description.length > MAX_DESCRIPTION_CHARS
     ? { ...hit, description: clipDescription(hit.description) }
     : hit)
   const merged = mergeCandidates(clipped)

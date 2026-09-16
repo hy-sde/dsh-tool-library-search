@@ -21,7 +21,8 @@ import { getJson, type SourceContext } from './http.ts'
 interface GithubRepo {
   readonly full_name?: string
   readonly html_url?: string
-  readonly description?: string
+  /** GitHub returns `null` for repos without a description. */
+  readonly description?: string | null
   readonly stargazers_count?: number
 }
 
@@ -74,7 +75,7 @@ export async function searchGithub(
       ecosystem: 'github',
       kind: 'project',
       link: repo.html_url ?? `https://github.com/${repo.full_name}`,
-      ...(repo.description !== undefined ? { description: repo.description } : {}),
+      ...(repo.description != null ? { description: repo.description } : {}),
       ...(repo.stargazers_count !== undefined ? { stars: repo.stargazers_count } : {}),
       repository: repo.full_name,
       sources: ['github'],
