@@ -7,8 +7,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hy-sde/dsh-plugins.git",
-    "directory": "dsh-tool-library-search/packages/tool-library-search"
+    "url": "git+https://github.com/hy-sde/dsh-tool-library-search.git",
+    "directory": "packages/tool-library-search"
   },
   "type": "module",
   "main": "./dist/index.js",
@@ -111,5 +111,9 @@
     "github",
     "semantic-search",
     "tool"
-  ]
+  ],
+  "homepage": "https://github.com/hy-sde/dsh-tool-library-search#readme",
+  "bugs": {
+    "url": "https://github.com/hy-sde/dsh-tool-library-search/issues"
+  }
 }
