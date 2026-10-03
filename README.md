@@ -1,3 +1,9 @@
+<!-- MIRROR-NOTE:START -->
+> [!NOTE]
+> 📦 This plugin lives in the [**dsh-plugins**](https://github.com/hy-sde/dsh-plugins) monorepo — file issues & pull requests there.
+> npm: [`@hy-sde-org/dsh-tool-library-search`](https://www.npmjs.com/package/@hy-sde-org/dsh-tool-library-search)
+<!-- MIRROR-NOTE:END -->
+
 # dsh-tool-library-search — "has this already been built?" for DeepSeek Harness
 
 One standalone package, installable as **one plugin row**, for the DeepSeek
