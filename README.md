@@ -42,6 +42,17 @@ agent-plane row like the harness's own tool rows and consumes the stock
   best-effort per candidate (registry `readme` fields or
   `raw.githubusercontent.com/…/README.md`).
 
+## Prerequisites
+
+- Node.js 22.19 or newer (the package's `engines` floor) with npm and pnpm on `PATH`;
+- a DeepSeek Harness installation including the standard `dsh` CLI — the peer baseline
+  is `@deepseek-ai/cordis ~4.0.4` and
+  `@deepseek-ai/dsh-tools`/`@deepseek-ai/dsh-system-prompt` `^0.2.0-rc.2`;
+- no API key — the registry sources are free and anonymous. The optional semantic rerank
+  peer `@huggingface/transformers` (`>=3.7.1 <5`) downloads ~25 MB of model weights
+  once; without it the tool answers with lexical ranking and notes the rerank was
+  unavailable.
+
 ## Install
 
 ```bash
@@ -61,6 +72,18 @@ pnpm install                              # workspace setup
 pnpm -r --filter './packages/*' build
 pnpm -r --filter './packages/*' pack      # defaults to prebuilt dist/ (prepack rebuilds)
 dsh plugin --profile web add "$PWD/packages/tool-library-search/hy-sde-org-….tgz"
+```
+
+### Verify
+
+```bash
+dsh web --dump-config   # look for the hy-sde-libsearch-tool-library-search row
+```
+
+### Uninstall
+
+```bash
+dsh plugin --profile web remove @hy-sde-org/dsh-tool-library-search
 ```
 
 ## Mounting
@@ -118,5 +141,6 @@ injected fetch seam and parser tests use fixture pages.
 MIT — see [LICENSE](./LICENSE) and [packages/tool-library-search/LICENSE](./packages/tool-library-search/LICENSE).
 
 See also: [packages/tool-library-search/README.md](./packages/tool-library-search/README.md) (full package
-docs), [SECURITY.md](./SECURITY.md), [CONTRIBUTING.md](./CONTRIBUTING.md),
-[THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md).
+docs), [packages/tool-library-search/README.zh.md](./packages/tool-library-search/README.zh.md) (中文说明),
+the repo [SECURITY.md](./SECURITY.md), [CONTRIBUTING.md](./CONTRIBUTING.md), and
+THIRD-PARTY-NOTICES.md.
