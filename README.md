@@ -13,6 +13,8 @@ Harness CLI:
 |---|---|---|
 | `@hy-sde-org/dsh-tool-library-search` | the plugin: model-facing `library_search` tool + `library:search` prompt section (`hy-sde-libsearch-tool-library-search` row) | yes |
 
+## Why
+
 `library_search` answers "has someone already built this?" **before** the
 model writes a new library or reimplements a wheel: one call fans the query
 out to the free, no-credential registry sources concurrently — deps.dev
