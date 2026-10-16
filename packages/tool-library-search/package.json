@@ -1,7 +1,7 @@
 {
   "name": "@hy-sde-org/dsh-tool-library-search",
   "description": "Model-facing library_search tool: free cross-ecosystem (npm/crates.io/Maven/Go/PyPI/RubyGems + GitHub) 'has this already been built?' search — exact-name ranked, stars/downloads as fitness signals, no API key required",
-  "version": "0.2.1-alpha.2",
+  "version": "0.2.1-alpha.4",
   "publishConfig": {
     "access": "public"
   },
