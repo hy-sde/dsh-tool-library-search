@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { renderResult, searchLibraries } from '../src/library-search.ts'
 import type { Fetcher } from '../src/sources/http.ts'
@@ -97,17 +98,16 @@ describe('library_search tool mount', () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     applyLibrarySearchTool(ctx, { fetch: OPTIONS.fetch, timeoutMs: 5000 })
     const section = buildLibrarySearchPromptSection()
     ctx.systemPrompt.section(section)
 
     const result = await ctx.tools.execute({
+      calls: [{ type: 'tool-call' as const, id: ToolCallId('ls-1'), name: 'library_search', arguments: JSON.stringify({ query: 'serde_yaml' }) }],
       signal: new AbortController().signal,
-      callId: ToolCallId('ls-1'),
-      name: 'library_search',
-      arguments: { query: 'serde_yaml' },
       agent: { session: { header: { id: 't1', cwd: '' } } } as never,
-    })
+    }).then(b => b.results[0]!.result)
     expect(result.isError).toBe(false)
     const content = result.content.filter(b => b.type === 'text').map(b => b.text).join(' ')
     expect(content).toContain('serde_yaml')
@@ -119,15 +119,14 @@ describe('library_search tool mount', () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     apply(ctx, { fetch: OPTIONS.fetch, timeoutMs: 5000 })
 
     const result = await ctx.tools.execute({
+      calls: [{ type: 'tool-call' as const, id: ToolCallId('ls-2'), name: 'library_search', arguments: JSON.stringify({ query: '   ' }) }],
       signal: new AbortController().signal,
-      callId: ToolCallId('ls-2'),
-      name: 'library_search',
-      arguments: { query: '   ' },
       agent: { session: { header: { id: 't2', cwd: '' } } } as never,
-    })
+    }).then(b => b.results[0]!.result)
     expect(result.isError).toBe(true)
 
     await ctx.fiber.dispose()
@@ -137,6 +136,7 @@ describe('library_search tool mount', () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     const embedder = {
       label: 'stub',
       async embed(texts: readonly string[]): Promise<readonly (readonly number[])[]> {
@@ -154,12 +154,10 @@ describe('library_search tool mount', () => {
     applyLibrarySearchTool(ctx, { fetch: semanticFetch, timeoutMs: 5000, semantic: true, embedder })
 
     const result = await ctx.tools.execute({
+      calls: [{ type: 'tool-call' as const, id: ToolCallId('ls-3'), name: 'library_search', arguments: JSON.stringify({ query: 'serde_yaml' }) }],
       signal: new AbortController().signal,
-      callId: ToolCallId('ls-3'),
-      name: 'library_search',
-      arguments: { query: 'serde_yaml' },
       agent: { session: { header: { id: 't3', cwd: '' } } } as never,
-    })
+    }).then(b => b.results[0]!.result)
     expect(result.isError).toBe(false)
     const content = result.content.filter(b => b.type === 'text').map(b => b.text).join(' ')
     expect(content).toContain('serde_yaml')
@@ -191,17 +189,16 @@ describe('library_search tool mount', () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     // No `embedder` injected: the local transformers.js peer is not installed
     // in this hermetic test env, so rerankSemantic must be caught and noted.
     applyLibrarySearchTool(ctx, { fetch: OPTIONS.fetch, timeoutMs: 5000, semantic: true, embedderModel: 'definitely-nonexistent' })
 
     const result = await ctx.tools.execute({
+      calls: [{ type: 'tool-call' as const, id: ToolCallId('ls-4'), name: 'library_search', arguments: JSON.stringify({ query: 'yaml'}) }],
       signal: new AbortController().signal,
-      callId: ToolCallId('ls-4'),
-      name: 'library_search',
-      arguments: { query: 'yaml' },
       agent: { session: { header: { id: 't4', cwd: '' } } } as never,
-    })
+    }).then(b => b.results[0]!.result)
     expect(result.isError).toBe(false)
     const content = result.content.filter(b => b.type === 'text').map(b => b.text).join(' ')
     expect(content).toContain('semantic rerank unavailable')
