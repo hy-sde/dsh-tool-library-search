@@ -6,7 +6,7 @@
  */
 
 import type { Candidate } from '../candidates.ts'
-import { getJson, requireEnvelope, type SourceContext } from './http.ts'
+import { getJson, requireEnvelope, takeValid, type SourceContext } from './http.ts'
 
 interface NpmSearchObject {
   readonly package?: {
@@ -34,7 +34,12 @@ export async function searchNpm(query: string, ctx: SourceContext, limit: number
     `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(query)}&size=${limit}`,
     ctx,
   ) as NpmSearchResponse
-  const objects = requireEnvelope(data, 'npm', 'objects').objects as NpmSearchObject[]
+  const objects = takeValid<NpmSearchObject>(
+    requireEnvelope(data, 'npm', 'objects').objects as unknown[],
+    object => object.package?.name !== undefined && object.package.name.length > 0,
+    'npm',
+    'objects',
+  )
   const candidates: Candidate[] = []
   for (const object of objects) {
     const pkg = object.package

@@ -12,11 +12,18 @@
  * then walks pages until it has `limit` candidates or ran out of `next` links
  * (or hit `maxPages`, default 5 — each page is one of the 30/min searches).
  * Raise `perSourceLimit` (e.g. 300) to hand the semantic rerank a deep pool.
+ *
+ * CANCELLATION vs PARTIAL SUCCESS: aborting mid-paging THROWS — returning the
+ * earlier pages as success would render a cancelled search as a definitive
+ * (truncated) answer. GitHub's own `incomplete_results: true` flag (documented
+ * as "the search may be missing results", e.g. on timeout) surfaces as
+ * {@link SourceIncompleteError} with the hits gathered so far as `partial`:
+ * the ledger records the gap, the tool reports `complete: false`.
  * @module @hy-sde-org/dsh-tool-library-search/sources/github
  */
 
 import type { Candidate } from '../candidates.ts'
-import { getJson, requireEnvelope, type SourceContext } from './http.ts'
+import { getJson, requireEnvelope, SourceHttpError, SourceIncompleteError, takeValid, type SourceContext } from './http.ts'
 
 interface GithubRepo {
   readonly full_name?: string
@@ -28,10 +35,36 @@ interface GithubRepo {
 
 interface GithubSearchResponse {
   readonly items?: GithubRepo[]
+  /** GitHub sets this when the search may be missing results (timeout). */
+  readonly incomplete_results?: boolean
 }
 
 /** Pages fetched per query at most; each is one search-API request. */
 const DEFAULT_MAX_PAGES = 5
+
+/** Validate collected repos and shape them into candidates (order preserved). */
+function collectCandidates(items: readonly GithubRepo[], limit: number): Candidate[] {
+  const usable = takeValid<GithubRepo>(
+    items,
+    repo => typeof repo.full_name === 'string' && repo.full_name.length > 0,
+    'github',
+    'items',
+  )
+  const candidates: Candidate[] = []
+  for (const repo of usable.slice(0, limit)) {
+    candidates.push({
+      name: repo.full_name as string,
+      ecosystem: 'github',
+      kind: 'project',
+      link: repo.html_url ?? `https://github.com/${repo.full_name as string}`,
+      ...(repo.description != null ? { description: repo.description } : {}),
+      ...(repo.stargazers_count !== undefined ? { stars: repo.stargazers_count } : {}),
+      repository: repo.full_name as string,
+      sources: ['github'],
+    })
+  }
+  return candidates
+}
 
 /**
  * Run one GitHub repository search with name/description + optional language
@@ -40,9 +73,11 @@ const DEFAULT_MAX_PAGES = 5
  * 10/min unauth budget on a single query).
  * @param limit - how many candidates to return (per-source cap).
  * @param maxPages - page ceiling; defaults to 1 without a token, 5 with one.
- * @throws {SourceHttpError} propagated from the transport layer, or thrown
- *   when a page's `items` envelope is missing (GitHub always returns `items` —
- *   its absence is a failure, not an empty result).
+ * @throws {SourceHttpError} propagated from the transport layer, when a page's
+ *   `items` envelope is missing (GitHub always returns `items` — its absence
+ *   is a failure, not an empty result), or on cancellation mid-paging.
+ * @throws {SourceIncompleteError} when GitHub reports `incomplete_results`;
+ *   hits collected so far ride along as `partial`.
  */
 export async function searchGithub(
   query: string,
@@ -60,29 +95,28 @@ export async function searchGithub(
   const perPage = Math.min(Math.max(limit, 1), 100)
   const items: GithubRepo[] = []
   for (let page = 1; page <= pageCap; page++) {
-    if (ctx.signal?.aborted) break
+    // Cancellation is not a partial result: stop the whole source with a
+    // failure so the ledger never dresses a truncated page walk as success.
+    if (ctx.signal?.aborted) {
+      throw new SourceHttpError('aborted for github search')
+    }
     const data = await getJson(
       `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=${perPage}&page=${page}`,
       ctx,
     ) as GithubSearchResponse
     const batch = requireEnvelope(data, 'github', 'items').items as GithubRepo[]
     items.push(...batch)
+    // GitHub says this page's search may be missing results. Everything
+    // collected so far is real, so it rides the error as `partial` instead of
+    // being silently promoted to a definitive (but truncated) success.
+    if (data.incomplete_results === true) {
+      throw new SourceIncompleteError(
+        'github: reported potentially incomplete results (incomplete_results)',
+        collectCandidates(items, limit),
+      )
+    }
     if (items.length >= limit) break
     if (batch.length < perPage) break
   }
-  const candidates: Candidate[] = []
-  for (const repo of items.slice(0, limit)) {
-    if (repo.full_name === undefined) continue
-    candidates.push({
-      name: repo.full_name,
-      ecosystem: 'github',
-      kind: 'project',
-      link: repo.html_url ?? `https://github.com/${repo.full_name}`,
-      ...(repo.description != null ? { description: repo.description } : {}),
-      ...(repo.stargazers_count !== undefined ? { stars: repo.stargazers_count } : {}),
-      repository: repo.full_name,
-      sources: ['github'],
-    })
-  }
-  return candidates
+  return collectCandidates(items, limit)
 }

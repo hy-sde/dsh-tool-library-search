@@ -21,7 +21,7 @@
  */
 
 import type { Candidate } from './candidates.ts'
-import { composeAbortSignal, SourceHttpError } from './sources/http.ts'
+import { composeAbortSignal, readBodyCapped, SourceHttpError } from './sources/http.ts'
 import type { Fetcher, SourceContext } from './sources/http.ts'
 
 /** Maximum characters retained from one README before embedding. */
@@ -125,46 +125,6 @@ export async function fetchCandidateReadme(
   }
   void lastError // best-effort by design; failures are normal (no README)
   return undefined
-}
-
-/**
- * Read a response body as a stream up to `maxBytes`, then stop (cancelling the
- * stream). Honors the external cancellation signal: once aborted, no further
- * chunks are pulled.
- */
-async function readBodyCapped(
-  response: Response,
-  maxBytes: number,
-  signal: AbortSignal | undefined,
-): Promise<{ text: string; truncated: boolean }> {
-  const body = response.body
-  if (body === null) return { text: '', truncated: false }
-  const reader = body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let bytes = 0
-  let text = ''
-  let truncated = false
-  try {
-    for (;;) {
-      if (signal?.aborted) {
-        truncated = true
-        break
-      }
-      const { done, value } = await reader.read()
-      if (done) break
-      bytes += value.byteLength
-      text += decoder.decode(value, { stream: true })
-      if (bytes >= maxBytes) {
-        truncated = true
-        break
-      }
-    }
-  } finally {
-    if (truncated) void reader.cancel().catch(() => {})
-    else void reader.cancel().catch(() => {}) // fully consumed; cancel is a no-op
-  }
-  if (!truncated) text += decoder.decode()
-  return { text, truncated }
 }
 
 /** GET a URL as capped text; npm JSON returns `readme`, raw returns the body. */

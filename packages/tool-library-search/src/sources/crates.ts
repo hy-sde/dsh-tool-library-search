@@ -6,7 +6,7 @@
  */
 
 import type { Candidate } from '../candidates.ts'
-import { getJson, requireEnvelope, type SourceContext } from './http.ts'
+import { getJson, requireEnvelope, takeValid, type SourceContext } from './http.ts'
 
 interface Crate {
   readonly name?: string
@@ -32,7 +32,12 @@ export async function searchCrates(query: string, ctx: SourceContext, limit: num
     `https://crates.io/api/v1/crates?q=${encodeURIComponent(query)}&per_page=${limit}`,
     ctx,
   ) as CratesResponse
-  const crates = requireEnvelope(data, 'crates.io', 'crates').crates as Crate[]
+  const crates = takeValid<Crate>(
+    requireEnvelope(data, 'crates.io', 'crates').crates as unknown[],
+    crate => crate.name !== undefined && crate.name.length > 0,
+    'crates.io',
+    'crates',
+  )
   const candidates: Candidate[] = []
   for (const crate of crates) {
     if (crate.name === undefined) continue

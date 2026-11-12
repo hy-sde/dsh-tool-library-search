@@ -10,6 +10,8 @@
  * @module @hy-sde-org/dsh-tool-library-search/sources/http
  */
 
+import type { Candidate } from '../candidates.ts'
+
 /** Transport errors carry this code so fan-out can classify them. */
 export class SourceHttpError extends Error {
   readonly status: number | null
@@ -18,6 +20,24 @@ export class SourceHttpError extends Error {
     super(message)
     this.name = 'SourceHttpError'
     this.status = status
+  }
+}
+
+/**
+ * Upstream ran but REPORTED incomplete coverage (e.g. GitHub's
+ * `incomplete_results` flag). Any hits collected so far are real and ride
+ * along in `partial`; the ledger records the gap, because a truncated search
+ * rendered as a clean success would let a model conclude "nothing exists"
+ * from data GitHub itself says may be missing.
+ */
+export class SourceIncompleteError extends SourceHttpError {
+  /** Hits gathered before upstream reported the gap (may be empty). */
+  readonly partial: readonly Candidate[]
+
+  constructor(message: string, partial: readonly Candidate[] = []) {
+    super(message)
+    this.name = 'SourceIncompleteError'
+    this.partial = partial
   }
 }
 
@@ -118,4 +138,90 @@ export async function getJson(url: string, ctx: SourceContext): Promise<unknown>
     const message = error instanceof Error ? error.message : String(error)
     throw new SourceHttpError(`fetch failed for ${url}: ${message}`)
   }
+}
+
+/**
+ * Filter envelope items down to the records this source can actually use.
+ * Item-level validation guards against a partially-malformed page: one
+ * nameless entry must not crash the whole fan-out (an undefined `name` used
+ * to escape as a TypeError and kill the entire search, taking healthy
+ * sources' candidates down with it). But an envelope where NOTHING parses is
+ * a shape change, not "no hits", and fails the source outright.
+ */
+export function takeValid<T>(
+  items: readonly unknown[],
+  isUsable: (item: T) => boolean,
+  source: string,
+  field: string,
+): T[] {
+  const valid: T[] = []
+  for (const item of items) {
+    if (typeof item !== 'object' || item === null) continue
+    if (isUsable(item as T)) valid.push(item as T)
+  }
+  if (items.length > 0 && valid.length === 0) {
+    throw new SourceHttpError(`${source}: malformed response (${items.length} ${field}, none parseable)`)
+  }
+  return valid
+}
+
+/** Result of {@link readBodyCapped}: decoded text plus whether the cap hit. */
+export interface CappedBody {
+  /** UTF-8 text read before the cap (or the whole body when under it). */
+  readonly text: string
+  /** True when the byte cap or the signal stopped the stream early. */
+  readonly truncated: boolean
+}
+
+/**
+ * Read a response body as a UTF-8 stream up to `maxBytes`, then stop pulling.
+ *
+ * Byte-exact: only the remaining permitted bytes of each chunk are decoded —
+ * `decoder.decode(slice, { stream: true })` keeps a cut multi-byte code point
+ * pending inside the decoder — so a hostile 200 KB chunk cannot push 200 KB of
+ * string through a 64 KB cap. Stream cancellation is AWAITED: the helper
+ * settles only after teardown ran, and a failing `cancel()` is swallowed so it
+ * never masks the original read error. Once `signal` aborts, no further chunks
+ * are pulled.
+ */
+export async function readBodyCapped(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal | undefined,
+): Promise<CappedBody> {
+  const body = response.body
+  if (body === null) return { text: '', truncated: false }
+  const reader = body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let bytes = 0
+  let text = ''
+  let truncated = false
+  try {
+    for (;;) {
+      if (signal?.aborted) {
+        truncated = true
+        break
+  }
+      const { done, value } = await reader.read()
+      if (done) break
+      const remaining = maxBytes - bytes
+      if (remaining <= 0) {
+        truncated = true
+        break
+}
+      const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value
+      bytes += slice.byteLength
+      text += decoder.decode(slice, { stream: true })
+      if (bytes >= maxBytes) truncated = true
+      if (truncated) break
+    }
+  } finally {
+    try {
+      await reader.cancel()
+    } catch {
+      // Stream teardown failures must not mask the original read error.
+    }
+  }
+  if (!truncated) text += decoder.decode()
+  return { text, truncated }
 }

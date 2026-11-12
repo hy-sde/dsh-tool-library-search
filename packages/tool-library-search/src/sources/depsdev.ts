@@ -12,7 +12,7 @@
  */
 
 import type { Candidate, Ecosystem } from '../candidates.ts'
-import { getJson, requireEnvelope, type SourceContext } from './http.ts'
+import { getJson, requireEnvelope, takeValid, type SourceContext } from './http.ts'
 
 /** Whole set of names deps.dev search can surface. */
 const DEPSDEV_SYSTEM_TO_ECOSYSTEM: Readonly<Record<string, Ecosystem>> = {
@@ -27,7 +27,7 @@ const DEPSDEV_SYSTEM_TO_ECOSYSTEM: Readonly<Record<string, Ecosystem>> = {
 
 interface DepsDevResult {
   readonly kind: 'PACKAGE' | 'PROJECT'
-  readonly name: string
+  readonly name?: string
   readonly system?: string | null
   readonly projectType?: string
   readonly defaultVersion?: string | null
@@ -43,12 +43,21 @@ interface DepsDevSearchResponse {
  *   thrown when the response envelope is missing (the `_/search` endpoint
  *   always returns a `results` array — its absence is a failure, not an
  *   empty result).
+ *   Item-level malformed entries (e.g. a result with no `name`) are also a
+ *   source failure when NOTHING parses — one bad entry used to escape as a
+ *   TypeError (`toLowerCase` of undefined) that killed the entire fan-out.
  */
 export async function searchDepsDev(query: string, ctx: SourceContext, limit: number): Promise<Candidate[]> {
   const data = await getJson(`https://deps.dev/_/search?q=${encodeURIComponent(query)}`, ctx) as DepsDevSearchResponse
-  const results = requireEnvelope(data, 'deps.dev', 'results').results as DepsDevResult[]
+  const results = takeValid<DepsDevResult>(
+    requireEnvelope(data, 'deps.dev', 'results').results as unknown[],
+    result => typeof result.name === 'string' && result.name.length > 0,
+    'deps.dev',
+    'results',
+  )
   const candidates: Candidate[] = []
   for (const result of results.slice(0, limit)) {
+    if (result.name === undefined) continue
     if (result.kind === 'PROJECT') {
       // GitHub project entry: `owner/repo`.
       candidates.push({

@@ -2,8 +2,12 @@
  * pkg.go.dev source: Go module/package search. pkg.go.dev has NO JSON search
  * API — `/search` is server-rendered HTML. We parse the `SearchSnippet` cards
  * its own frontend consumes (verified structure, 2026-09-06) with a tolerant
- * regex pull: if the page shape changes we return ZERO candidates (never throw
- * — the fan-out tolerates it, and deps.dev already covers Go names). Each hit
+ * regex pull. A page we cannot recognize is NOT silently zero hits: a
+ * genuine no-results page carries the `gopher-message` "no matches" marker
+ * (verified live 2026-11-12), while anything else — result cards that fail
+ * to parse, or a page with neither cards nor the marker — fails the source
+ * with {@link SourceIncompleteError} so the ledger records the gap instead
+ * of rendering an unreadable page as a definitive "nothing on Go". Each hit
  * carries the canonical import path as its name, the synopsis as description,
  * and the "Imported by" count as a popularity signal (`imports`), which gives
  * Go candidates a fitness number like npm/crates downloads.
@@ -15,7 +19,14 @@
  */
 
 import type { Candidate } from '../candidates.ts'
-import { SourceHttpError, type Fetcher, type SourceContext } from './http.ts'
+import {
+  composeAbortSignal,
+  readBodyCapped,
+  SourceHttpError,
+  SourceIncompleteError,
+  type Fetcher,
+  type SourceContext,
+} from './http.ts'
 
 /** One parsed card from the pkg.go.dev search page. */
 export interface PkgGoDevHit {
@@ -43,14 +54,24 @@ function decodeEntities(text: string): string {
     .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
 }
 
+/** Byte cap on the pkg.go.dev HTML response (search pages run ~30–100 KB). */
+const PKGGODEV_MAX_BYTES = 512_000
+
+/** True when the page looks like a rendered search page at all (cards present). */
+function hasResultCards(html: string): boolean {
+  return /<div class="SearchSnippet"\s*>/.test(html) || /data-test-id="snippet-title"/.test(html)
+}
+
 function stripTags(text: string): string {
   return decodeEntities(text.replace(/<[^>]*>/g, '')).trim()
 }
 
 /**
  * Parse pkg.go.dev `/search` HTML into hits. Returns up to `limit` cards.
- * Tolerant by design: unknown/missing fields are skipped, and a structurally
- * unexpected page yields `[]` — the caller treats that as "no Go hits".
+  * Tolerant by design: unknown/missing fields are skipped. A structurally
+  * unexpected page yields `[]` — the caller then distinguishes a genuine
+  * no-results page (marker present) from an unreadable one and fails with
+  * {@link SourceIncompleteError} in the latter case.
  */
 export function parsePkgGoDevSearch(html: string, limit: number): PkgGoDevHit[] {
   const hits: PkgGoDevHit[] = []
@@ -88,10 +109,14 @@ export function parsePkgGoDevSearch(html: string, limit: number): PkgGoDevHit[] 
 
 /**
  * Search pkg.go.dev for a query; returns Go candidates (canonical import path
- * as name). Parsing failure or an unexpected page shape returns `[]` — this
- * source is enrichment, never a blocker.
- * @throws {import('./http.ts').SourceHttpError} only when the TRANSPORT fails
- * (network/HTTP error) — same contract as the other sources.
+  * as name). A genuine no-results page (the `gopher-message` marker, verified
+  * live) returns `[]`. This source is enrichment, never a blocker.
+  * @throws {import('./http.ts').SourceHttpError} when the TRANSPORT fails
+  *   (network/HTTP error/timeout/abort) — same contract as the other sources.
+  * @throws {import('./http.ts').SourceIncompleteError} when the page shape is
+  *   unrecognized (result cards present but none parseable, or neither cards
+  *   nor the no-results marker — we cannot confirm an empty result from a
+  *   page we do not understand).
  */
 export async function searchPkgGoDev(
   query: string,
@@ -99,18 +124,32 @@ export async function searchPkgGoDev(
   limit: number,
 ): Promise<Candidate[]> {
   const fetcher: Fetcher = ctx.fetch ?? globalThis.fetch.bind(globalThis)
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), ctx.timeoutMs)
+  // Honor the caller's cancellation signal (fused with the timeout) instead
+  // of a private timer-only controller that ignores exec.signal.
+  const signal = composeAbortSignal({ timeoutMs: ctx.timeoutMs, ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}) })
   try {
     const response = await fetcher(`https://pkg.go.dev/search?q=${encodeURIComponent(query)}`, {
       headers: { 'User-Agent': ctx.userAgent, Accept: 'text/html' },
-      signal: controller.signal,
+      signal,
     })
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} for pkg.go.dev/search`)
     }
-    const html = await response.text()
+    const { text: html } = await readBodyCapped(response, PKGGODEV_MAX_BYTES, ctx.signal)
     const hits = parsePkgGoDevSearch(html, limit)
+    if (hits.length === 0) {
+      // Distinguish a confirmed empty page from one we failed to read.
+      // Verified live 2026-11-12: a zero-results page has NO SearchSnippet
+      // cards but DOES carry the gopher-message no-match text.
+      if (html.includes('no matches for your search')) {
+        return []
+    }
+      throw new SourceIncompleteError(
+        hasResultCards(html)
+          ? 'pkg.go.dev: search page changed shape (result cards present but none parseable)'
+          : 'pkg.go.dev: unrecognized search page (no result cards and no no-results marker)',
+      )
+    }
     return hits.map(hit => ({
       name: hit.path,
       ecosystem: 'go' as const,
@@ -122,9 +161,10 @@ export async function searchPkgGoDev(
       sources: ['pkg.go.dev'],
     }))
   } catch (error) {
+    if (ctx.signal?.aborted) {
+      throw new SourceHttpError('aborted for pkg.go.dev/search')
+    }
     const message = error instanceof Error ? error.message : String(error)
     throw new SourceHttpError(`pkg.go.dev search failed: ${message}`)
-  } finally {
-    clearTimeout(timer)
   }
 }
