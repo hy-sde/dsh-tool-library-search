@@ -29,7 +29,7 @@ import { mergeCandidates, rankCandidates } from './candidates.ts'
 import { searchCrates } from './sources/crates.ts'
 import { searchDepsDev } from './sources/depsdev.ts'
 import { searchGithub } from './sources/github.ts'
-import type { Fetcher, SourceContext } from './sources/http.ts'
+import { SourceIncompleteError, type Fetcher, type SourceContext } from './sources/http.ts'
 import { searchNpm } from './sources/npm.ts'
 import { searchPkgGoDev } from './sources/pkggodev.ts'
 
@@ -61,11 +61,12 @@ export interface LibrarySearchOptions {
 export interface SourceStatus {
   /** Source id, as shown in failure lines (e.g. `deps.dev`). */
   readonly id: string
-  /** ok = ran clean; failed = error (see `error`); skipped = not queried. */
-  readonly status: 'ok' | 'failed' | 'skipped'
+  /** ok = ran clean; incomplete = ran but reported gaps; failed = error (see
+   *  `error`); skipped = not queried. */
+  readonly status: 'ok' | 'incomplete' | 'failed' | 'skipped'
   /** Candidate hits the source contributed (0 when failed/skipped). */
   readonly hits: number
-  /** One-line reason when `status` is `failed`. */
+  /** One-line reason when `status` is `failed` or `incomplete`. */
   readonly error?: string
 }
 
@@ -100,6 +101,10 @@ export function clipDescription(description: string): string {
  * tolerated and reported (each becomes a `failed` {@link SourceStatus}); only
  * when EVERY queried source fails does this throw. Sources whose ecosystem
  * coverage cannot match the requested filter are skipped, not queried.
+ * A source that RAN but reported incomplete upstream data (GitHub's
+ * `incomplete_results`, an unreadable pkg.go.dev page) contributes whatever
+ * partial hits it returned and is marked `incomplete` — also counted as a
+ * failure so `complete` stays false downstream.
  * @param ecosystems - optional filter on result ecosystems (empty/undefined = all).
  * @throws when every queried source failed, or the call was cancelled.
  */
@@ -148,6 +153,14 @@ export async function searchLibraries(
     if (outcome.status === 'fulfilled') {
       hits.push(...outcome.value)
       statuses[statuses.indexOf(status)] = { ...status, status: 'ok', hits: outcome.value.length }
+    } else if (outcome.reason instanceof SourceIncompleteError) {
+      // The source RAN and returned partial data with a known gap: keep the
+      // partial hits, mark the ledger entry `incomplete`, and count it as a
+      // failure so zero-candidate renders read as INCOMPLETE, not definitive.
+      hits.push(...outcome.reason.partial)
+      const reason = outcome.reason.message
+      statuses[statuses.indexOf(status)] = { ...status, status: 'incomplete', hits: outcome.reason.partial.length, error: reason }
+      failures.push(`${status.id}: ${reason}`)
     } else {
       const reason = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
       statuses[statuses.indexOf(status)] = { ...status, status: 'failed', hits: 0, error: reason }
@@ -155,7 +168,8 @@ export async function searchLibraries(
     }
   }
   const queried = active.length
-  if (hits.length === 0 && failures.length === queried && queried > 0) {
+  const failedOrIncomplete = failures.length
+  if (hits.length === 0 && failedOrIncomplete === queried && queried > 0) {
     if (options.signal?.aborted) throw new Error('library search aborted')
     throw new Error(`all library-search sources failed: ${failures.join('; ')}`)
   }

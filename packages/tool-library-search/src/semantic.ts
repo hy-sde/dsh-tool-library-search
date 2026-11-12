@@ -39,6 +39,12 @@ export interface Embedder {
    * @throws when the embedder is unavailable.
    */
   probe?(): Promise<void>
+  /**
+   * Release underlying model resources (transformers.js pipelines expose
+   * `dispose()`). Called by the plugin's unload disposer AFTER in-flight
+   * searches drained. Optional: stub embedders need no teardown.
+   */
+  dispose?(): Promise<void>
 }
 
 /** Raised when semantic rerank is requested but no embedder is available. */
@@ -101,12 +107,24 @@ export async function rerankSemantic(
   embedder: Embedder,
   ctx: SourceContext,
 ): Promise<{ ranked: readonly (Candidate & { similarity: number })[]; usedReadmes: number; docsChecked: number }> {
+  const assertActive = (): void => {
+    if (ctx.signal?.aborted) {
+      throw new Error('semantic rerank aborted')
+    }
+  }
+  // Cancellation checks BETWEEN stages: once aborted, no further README
+  // traffic and no inference are started (stopping subsequent work). In-flight
+  // network work aborts via its fused signal.
+  assertActive()
   // Probe FIRST: an embedder that cannot run (optional peer missing) must be
   // detected before any README traffic is spent on its behalf.
   await embedder.probe?.()
+  assertActive()
   const docs = await fetchCandidateDocuments(candidates, ctx)
+  assertActive()
   const texts = [query, ...docs.map(document => document.text)]
   const vectors = await embedder.embed(texts)
+  assertActive()
   const queryVector = vectors[0]
   if (queryVector === undefined || vectors.length !== texts.length) {
     throw new SemanticUnavailableError(`semantic rerank: embedder returned ${vectors.length} vectors for ${texts.length} texts`)
@@ -137,6 +155,8 @@ export const DEFAULT_EMBEDDER_MODEL = 'Xenova/all-MiniLM-L6-v2'
 /** The transformers.js feature-extraction pipeline surface this embedder uses. */
 interface LocalPipeline {
   extractor: (texts: string[], options: { pooling: string; normalize: boolean }) => Promise<{ tolist(): number[][] }>
+  /** Present on real transformers.js pipelines; stubs in tests may omit it. */
+  dispose?: () => unknown
 }
 
 /**
@@ -149,6 +169,9 @@ interface LocalPipeline {
  * model instead of silently reusing the first one (review claim 6). The first
  * `embed()` call downloads/caches the model (~25 MB); subsequent calls reuse
  * the loaded pipeline. Failed loads reset, so a later install can retry.
+ * `dispose()` releases the loaded pipeline: after it runs, the next `embed()`
+ * reloads the model from cache (fresh instance, not the disposed one). The
+ * plugin's unload disposer awaits it after in-flight searches drained.
  * @param model - HF model id (default {@link DEFAULT_EMBEDDER_MODEL}).
  */
 export function createLocalEmbedder(model: string = DEFAULT_EMBEDDER_MODEL): Embedder {
@@ -165,10 +188,7 @@ export function createLocalEmbedder(model: string = DEFAULT_EMBEDDER_MODEL): Emb
             pipeline(task: string, model: string, options?: Record<string, unknown>): Promise<unknown>
           }
           const pipeline = mod.pipeline
-          return {
-            extractor: await pipeline('feature-extraction', model, { dtype: 'q8' }) as unknown as
-              LocalPipeline['extractor'],
-          }
+          return await pipeline('feature-extraction', model, { dtype: 'q8' }) as unknown as LocalPipeline
         } catch {
           return null
         }
@@ -195,6 +215,13 @@ export function createLocalEmbedder(model: string = DEFAULT_EMBEDDER_MODEL): Emb
       if (pipeline === null) throw unavailable()
       const output = await pipeline.extractor([...texts], { pooling: 'mean', normalize: true })
       return output.tolist()
+    },
+    async dispose(): Promise<void> {
+      if (pipelinePromise === null) return // never loaded; nothing to release
+      const pending = pipelinePromise
+      pipelinePromise = null // disposed: a later embed() reloads a fresh pipeline
+      const pipeline = await pending
+      await pipeline?.dispose?.()
     },
   }
 }
