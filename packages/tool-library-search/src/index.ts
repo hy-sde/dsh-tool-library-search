@@ -15,7 +15,11 @@ import {
   applyLibrarySearchTool,
   type LibrarySearchToolConfig,
 } from './tool.ts'
-import { buildLibrarySearchPromptSection } from './prompt.ts'
+import {
+  LIBRARY_SEARCH_PROMPT_TEXT,
+  LIBRARY_SEARCH_SECTION_NAME,
+  LIBRARY_SEARCH_SECTION_ORDER,
+} from './prompt.ts'
 
 export {
   ECOSYSTEMS,
@@ -34,6 +38,7 @@ export {
 export type {
   LibrarySearchOptions,
   LibrarySearchResult,
+  SourceStatus,
 } from './library-search.ts'
 export {
   applyLibrarySearchTool,
@@ -44,8 +49,11 @@ export type {
 } from './tool.ts'
 export {
   buildLibrarySearchPromptSection,
+  LIBRARY_SEARCH_PROMPT_TEXT,
+  LIBRARY_SEARCH_SECTION_NAME,
+  LIBRARY_SEARCH_SECTION_ORDER,
 } from './prompt.ts'
-export { getJson, SourceHttpError } from './sources/http.ts'
+export { composeAbortSignal, getJson, requireEnvelope, SourceHttpError } from './sources/http.ts'
 export type { Fetcher, SourceContext } from './sources/http.ts'
 export { searchCrates } from './sources/crates.ts'
 export { searchDepsDev } from './sources/depsdev.ts'
@@ -53,8 +61,8 @@ export { searchGithub } from './sources/github.ts'
 export { searchNpm } from './sources/npm.ts'
 export { parsePkgGoDevSearch, searchPkgGoDev } from './sources/pkggodev.ts'
 export type { PkgGoDevHit } from './sources/pkggodev.ts'
-export { fetchCandidateDocuments, fetchCandidateReadme, readmeUrlsFor } from './readme.ts'
-export type { CandidateDocument } from './readme.ts'
+export { fetchCandidateDocuments, fetchCandidateReadme, parseRepositoryOwnerRepo, readmeUrlsFor } from './readme.ts'
+export type { CandidateDocument, RepoSlug } from './readme.ts'
 export {
   cosineSimilarity,
   createLocalEmbedder,
@@ -77,7 +85,17 @@ export const inject = ['tools', 'systemPrompt']
  */
 export function apply(ctx: Context, config: LibrarySearchToolConfig = {}): void {
   applyLibrarySearchTool(ctx, config)
-  ctx.systemPrompt.section(buildLibrarySearchPromptSection())
+  // Visibility-aware section: the guidance text is a function of the
+  // assembling scope/tool set, so scopes without the tool carry no stale
+  // advice (harness pattern: packages/web/tool-web/src/search.ts).
+  ctx.systemPrompt.section({
+    name: LIBRARY_SEARCH_SECTION_NAME,
+    order: LIBRARY_SEARCH_SECTION_ORDER,
+    text: ({ scope, toolSet }) =>
+      config.prompt === false || ctx.tools.get('library_search', scope, toolSet) === undefined
+        ? ''
+        : LIBRARY_SEARCH_PROMPT_TEXT,
+  })
 }
 
 /** Cordis plugin object for `@hy-sde-org/dsh-tool-library-search`. */
