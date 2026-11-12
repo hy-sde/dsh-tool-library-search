@@ -6,16 +6,18 @@
 
 `dsh-tool-library-search` 给模型一个工具——`library_search`——其全部职责就是在它写新库或重新造轮子之前回答"这东西是不是已经有人做过了"。一次调用把查询并发地发往**免费、无需凭据**的数据源（deps.dev 负责跨生态的存在性检查，npm + crates.io 负责描述与下载量，GitHub 仓库搜索负责"已经有人做过"的语义信号），合并命中结果，并让**精确名称匹配排在最前**——人气只用于打破平局，因此一个恰好同名的小包会排在名字不同的大热门仓库之前。
 
-内置的 `library:search` 提示词片段教会模型何时使用它。
+内置的 `library:search` 提示词片段教会模型何时使用它。该片段只在工具对当前工具集可见时渲染，且可通过 `prompt: false` 配置整体关闭。
 
 ## 工具面
 
 - `library_search [query] [ecosystems] [language] [maxResults]` —— 一个自然语言需求或精确包名，例如 `"parse yaml"` 或 `"serde_yaml"`。
   - `ecosystems` —— 限定到 `npm | cargo | maven | go | pypi | rubygems | nuget | github`（默认全部）。
   - `language` —— GitHub 语言偏置（如 `rust`、`typescript`）；只影响 GitHub 仓库结果。
-  - `maxResults` —— 返回候选的上限（默认 20）。
+  - `maxResults` —— 返回候选的上限（默认 20；校验 1–100，且在搜索**之前**生效，工具不会超量抓取）。
 
 每个候选都标注了生态，并携带 GitHub star 或月下载量作为活跃度信号，以及报告它的来源（跨来源一致是置信度加分项）。
+
+**结果是结构化的。** 除 markdown 渲染外，工具输出携带类型化的候选列表与**逐来源状态账本**——每个来源一条 `ok | failed | skipped` 记录（skipped = 不在请求的生态范围内），含命中数与失败原因。`complete` 标志仅在没有来源失败时为真。当有来源失败**且**没有命中时，输出会明确说明这次搜索是不完整的（"结果可能缺失；请重试或收窄查询"），而不是让模型得出"不存在现成方案"的结论——静默抖动的来源绝不能被读成"没有先例"。
 
 ## 数据源（2026-09-06 实测验证）
 
@@ -46,8 +48,8 @@
 
 **实现方式**(`src/readme.ts` + `src/semantic.ts`):
 
-1. **README 获取,尽力而为、按候选进行。** npm 包取自 registry 自带的 `readme` 字段(每包一个 JSON 调用);GitHub 项目(以及 crates.io 条目带有 `repository` 的 cargo crate)取自 `raw.githubusercontent.com/<owner>/<repo>/HEAD/README.md`(附 `.rst` 回退)。**不使用** crates.io 的 `/readme` 端点:它重定向到 `static.crates.io/readmes/...`,对非浏览器客户端返回 403(2026-09-06 验证);改为跟随 `repository` 字段到 GitHub raw。Maven/PyPI 与 pkg.go.dev 的 Go 命中（没有 repository 字段）没有 README 通道——这些候选只嵌入名称+描述。抓取以有界并发(6)进行,每个 6s 超时,且单项容错:某个 README 缺失永远不会导致调用失败。
-2. **本地嵌入,免费且免密钥。** 查询 + 最多约 30 段 README 文本在一次批处理调用中嵌入,使用小型 all-MiniLM-L6-v2 量化模型(约 25 MB,首次下载后缓存),通过**可选对等依赖** `@huggingface/transformers`。无需 API key,无需外部嵌入服务。未安装该对等依赖时,`semantic: true` 会优雅降级为词法排序并在工具输出中说明。
+1. **README 获取,尽力而为、按候选进行。** npm 包取自 registry 自带的 `readme` 字段(每包一个 JSON 调用);GitHub 项目(以及 crates.io 条目带有 `repository` 的 cargo crate)取自 `raw.githubusercontent.com/<owner>/<repo>/HEAD/README.md`(附 `.rst` 回退)。**不使用** crates.io 的 `/readme` 端点:它重定向到 `static.crates.io/readmes/...`,对非浏览器客户端返回 403(2026-09-06 验证);改为跟随 `repository` 字段到 GitHub raw。Maven/PyPI 与 pkg.go.dev 的 Go 命中（没有 repository 字段）没有 README 通道——这些候选只嵌入名称+描述。抓取以有界并发(6)进行,每个 6s 超时,且单项容错:某个 README 缺失永远不会导致调用失败。响应体按**有界流**读取（原始 64 KB / JSON 256 KB 上限——绝不为了保留 12 KB 而完整缓冲 200 KB）,并且每次抓取都遵守调用方的取消信号。
+2. **本地嵌入,免费且免密钥。** 查询 + 最多约 30 段 README 文本在一次批处理调用中嵌入,使用小型 all-MiniLM-L6-v2 量化模型(约 25 MB,首次下载后缓存),通过**可选对等依赖** `@huggingface/transformers`。无需 API key,无需外部嵌入服务。嵌入器在抓取任何 README **之前先行探测**——未安装该对等依赖时,`semantic: true` 快速失败并降级为词法排序（并在工具输出中说明）,而不是先抓取一批根本无法嵌入的文档。
 3. **重排,契约保留。** 精确名称匹配(精确度 2)仍是硬顶层层级——没有任何东西能取代叫这个名字的包。其下 README 相似度(权重 800)主导;全名称 token 匹配只有 +300 的先手;人气只用于打破接近的分数。README 精确描述你所需内容的仓库即使名字毫不相关也会浮现出来。
 
 ## 配置
@@ -56,15 +58,19 @@
 import toolLibrarySearch from '@hy-sde-org/dsh-tool-library-search'
 
 ctx.plugin(toolLibrarySearch, {
-  timeoutMs: 12000,     // 单来源传输超时（默认 10000）
-  maxResults: 20,       // 合并排序后的默认结果上限（默认 15）
-  perSourceLimit: 8,    // 合并前单来源命中上限；带 token 时 >100 会对 GitHub 翻页
-  githubToken: 'ghp_…', // 可选：把 GitHub 仓库搜索配额从 10/分钟 提升到 30/分钟，并启用翻页
+  timeoutMs: 12000,     // 单来源传输超时（默认 10000；校验 1..120000）
+  maxResults: 20,       // 合并排序后的默认结果上限（默认 15；校验 1..100）
+  perSourceLimit: 8,    // 合并前单来源命中上限；带 token 时 >100 会对 GitHub 翻页（校验 1..500）
+  githubToken: 'ghp_…', // 可选：把 GitHub 仓库搜索配额从 10/分钟 提升到 30/分钟，并启用翻页；只发送给 api.github.com
   semantic: true,       // 启用 README 相似度重排（默认 false）
   embedderModel: 'Xenova/all-MiniLM-L6-v2', // 可选本地模型 id
-  semanticPoolSize: 50, // 进入重排的候选数（在 maxResults 截断之前）
+  semanticPoolSize: 50, // 进入重排的候选数（在 maxResults 截断之前；校验 1..500）
+  prompt: true,         // 注册 library:search 提示词片段（默认 true；false 则整体关闭）
 })
 ```
+
+越界或非整数的数值配置会在插件 apply 时快速失败。单次调用的 `args.maxResults`
+同样会被校验，且在不超量抓取的前提下封顶结果（搜索池按生效上限预先定容）。
 
 > 安装可选对等依赖以激活语义重排：
 > `npm i @huggingface/transformers`（或 `pnpm add @huggingface/transformers`）。

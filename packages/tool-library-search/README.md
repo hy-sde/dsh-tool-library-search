@@ -6,16 +6,18 @@ English | [中文](README.zh.md)
 
 `dsh-tool-library-search` gives the model one tool — `library_search` — whose whole job is to answer "has someone already built this?" before it writes a new library or reimplements a wheel. One call fans the query out to the **free, no-credential** data sources concurrently (deps.dev for cross-ecosystem existence, npm + crates.io for descriptions/downloads, GitHub repo search for the semantic "someone already built this" signal), merges the hits, and ranks **exact-name matches first** — popularity only breaks ties, so a small exactly-named package beats a popular repo with a different name.
 
-The included `library:search` prompt section teaches the model when to reach for it.
+The included `library:search` prompt section teaches the model when to reach for it. It renders only when the tool is visible in the active tool set, and a `prompt: false` config suppresses it entirely.
 
 ## Tool surface
 
 - `library_search [query] [ecosystems] [language] [maxResults]` — one natural-language need or exact package name, e.g. `"parse yaml"` or `"serde_yaml"`.
   - `ecosystems` — restrict to `npm | cargo | maven | go | pypi | rubygems | nuget | github` (default: all).
   - `language` — GitHub language bias (e.g. `rust`, `typescript`); only affects GitHub repo results.
-  - `maxResults` — upper bound on returned candidates (default 20).
+  - `maxResults` — upper bound on returned candidates (default 20; validated 1–100, and applied **before** the search so the tool never over-fetches).
 
 Each candidate is tagged with its ecosystem and carries GitHub stars or monthly downloads as fitness signals, plus the sources that reported it (cross-source agreement is a confidence co-signal).
+
+**The result is structured.** Beyond the markdown rendering, the tool output carries typed candidates and a **per-source ledger** — one entry per source with `ok | failed | skipped` (skipped = out of scope for the requested ecosystems), its hit count, and the failure reason. A `complete` flag is true only when no queried source failed. When sources failed **and** nothing matched, the answer explicitly says the search was INCOMPLETE ("results may be missing; retry or narrow the query") instead of letting the model conclude that nothing exists — a silently-flaked source must never read as "no prior art".
 
 ## Data sources (verified live, 2026-09-06)
 
@@ -40,7 +42,7 @@ Exactness dominates popularity by two orders of magnitude by design: if a packag
 
 **Descriptions are clipped.** Candidate one-line descriptions (GitHub repo
 descriptions are unvetted user text) are truncated to 300 chars with a `…`
-marker before merging/rinking, so one abusive 50k-char repo description cannot
+marker before merging/ranking, so one abusive 50k-char repo description cannot
 drown the answer.
 
 ## Semantic rerank (README similarity)
@@ -63,13 +65,17 @@ does not contain "markdown parser" but IS one.
    Maven/PyPI and pkg.go.dev Go hits (which carry no repository) have no README
    lane — those candidates embed their name+description only. Fetches run with
    bounded concurrency (6), a 6s timeout each, and are individually
-   fault-tolerant: one missing README never fails a call.
+   fault-tolerant: one missing README never fails a call. Bodies are read as a
+   **bounded stream** (64 KB raw / 256 KB JSON caps — a 200 KB README never
+   gets fully buffered just to keep 12 KB), and every fetch observes the
+   caller's cancellation signal.
 2. **Local embedding, free and keyless.** The query + up to ~30 README texts are
    embedded in one batched call with a small all-MiniLM-L6-v2 quantized model
    (~25 MB, cached after first download), via the **optional peer**
    `@huggingface/transformers`. No API key, no external embedding service.
-   Without that peer installed, `semantic: true` degrades gracefully to the
-   lexical ranking and says so in the tool output.
+   The embedder is **probed before any README is fetched** — without the peer
+   installed, `semantic: true` fails fast and degrades to the lexical ranking
+   (and says so in the tool output) instead of fetching docs it cannot embed.
 3. **Rerank, contract preserved.** Exact-name matches (exactness 2) stay a hard
    top tier — nothing unseats the package with THE name. Below that, README
    similarity (weight 800) leads; a full name-token match is only a +300 head
@@ -82,15 +88,20 @@ does not contain "markdown parser" but IS one.
 import toolLibrarySearch from '@hy-sde-org/dsh-tool-library-search'
 
 ctx.plugin(toolLibrarySearch, {
-  timeoutMs: 12000,     // per-source transport timeout (default 10000)
-  maxResults: 20,       // default result cap after merge+rank (default 15)
-  perSourceLimit: 8,    // per-source hit cap before merge; >100 pages GitHub when a token is set
-  githubToken: 'ghp_…', // optional: raises GitHub repo-search quota 10/min → 30/min AND enables paging
+  timeoutMs: 12000,     // per-source transport timeout (default 10000; validated 1..120000)
+  maxResults: 20,       // default result cap after merge+rank (default 15; validated 1..100)
+  perSourceLimit: 8,    // per-source hit cap before merge; >100 pages GitHub when a token is set (validated 1..500)
+  githubToken: 'ghp_…', // optional: raises GitHub repo-search quota 10/min → 30/min AND enables paging; sent ONLY to api.github.com
   semantic: true,       // enable README-similarity rerank (default false)
   embedderModel: 'Xenova/all-MiniLM-L6-v2', // optional local model id
-  semanticPoolSize: 50, // candidates entering the rerank before maxResults cut
+  semanticPoolSize: 50, // candidates entering the rerank before maxResults cut (validated 1..500)
+  prompt: true,         // register the library:search prompt section (default true; false suppresses it)
 })
 ```
+
+Out-of-range or non-integer numeric config fails fast at plugin apply time.
+Per-call `args.maxResults` is likewise validated and caps the result without
+over-fetching (the search pool is sized from the effective cap up front).
 
 > Install the optional peer to activate semantic rerank:
 > `npm i @huggingface/transformers` (or `pnpm add @huggingface/transformers`).
