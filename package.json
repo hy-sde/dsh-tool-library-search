@@ -1,6 +1,6 @@
 {
   "name": "dsh-tool-library-search",
-  "version": "0.1.7-rc.2",
+  "version": "0.2.2-rc.2",
   "private": true,
   "description": "Standalone public package: @hy-sde-org/dsh-tool-library-search (the 'has this already been built?' library/registry search tool plugin for DeepSeek Harness).",
   "type": "module",
@@ -12,8 +12,8 @@
     "check": "pnpm -r --filter './packages/*' check",
     "test": "pnpm -r --filter './packages/*' test",
     "pack:all": "pnpm -r --filter './packages/*' pack",
-    "release:check": "bash scripts/release-public.sh --check",
-    "release:publish": "bash scripts/release-public.sh --publish"
+    "release:check": "bash ../scripts/release-public.sh --check dsh-tool-library-search/packages/tool-library-search",
+    "release:publish": "bash ../scripts/release-public.sh --publish dsh-tool-library-search/packages/tool-library-search"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "~4.0.5",
