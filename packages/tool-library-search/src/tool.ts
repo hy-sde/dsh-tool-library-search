@@ -93,6 +93,91 @@ function validateBound(name: string, value: number, min: number, max: number): v
   }
 }
 
+/**
+ * Minimal structural mirror of a Standard Schema v1 validator (the shape Cordis
+ * reads via `Config['~standard'].validate`). Declared locally because
+ * `@standard-schema/spec` is not a dependency; structurally assignable.
+ */
+export interface ConfigSchema<T> {
+  '~standard': {
+    readonly version: 1
+    readonly vendor: string
+    validate(value: unknown): { value: T; issues?: undefined } | { value?: undefined; issues: readonly { readonly message: string }[] }
+  }
+}
+
+/** Every deployment-facing config key accepted by the plugin. */
+const CONFIG_KEYS = [
+  'timeoutMs',
+  'maxResults',
+  'perSourceLimit',
+  'githubToken',
+  'userAgent',
+  'fetch',
+  'semantic',
+  'embedder',
+  'embedderModel',
+  'semanticPoolSize',
+  'prompt',
+] as const
+
+/**
+ * Cordis `Config` validator: rejects unknown keys and wrong TYPES (numbers,
+ * strings, booleans, functions) before the plugin starts — a mount like
+ * `{ semantic: 'true' }` or `{ githubToken: 42 }` now fails loudly instead of
+ * silently flipping behavior. Numeric ranges reuse {@link CONFIG_BOUNDS}; the
+ * runtime {@link validateBound} calls stay as defense in depth for non-Cordis
+ * callers.
+ */
+export const LIBRARY_SEARCH_CONFIG_SCHEMA: ConfigSchema<LibrarySearchToolConfig> = {
+  '~standard': {
+    version: 1,
+    vendor: 'tool-library-search',
+    validate(value) {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        return { issues: [{ message: 'tool-library-search: config must be an object' }] }
+      }
+      const record = value as Record<string, unknown>
+      const issues: { message: string }[] = []
+      for (const key of Object.keys(record)) {
+        if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
+          issues.push({ message: `tool-library-search: unknown config key "${key}"` })
+        }
+      }
+      for (const [key, bound] of Object.entries(CONFIG_BOUNDS)) {
+        const raw = record[key]
+        if (raw === undefined) continue
+        if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < bound.min || raw > bound.max) {
+          issues.push({ message: `tool-library-search: ${key} must be an integer between ${bound.min} and ${bound.max} (got ${String(raw)})` })
+        }
+      }
+      for (const key of ['githubToken', 'userAgent', 'embedderModel'] as const) {
+        const raw = record[key]
+        if (raw !== undefined && typeof raw !== 'string') {
+          issues.push({ message: `tool-library-search: ${key} must be a string (got ${typeof raw})` })
+        }
+      }
+      for (const key of ['semantic', 'prompt'] as const) {
+        const raw = record[key]
+        if (raw !== undefined && typeof raw !== 'boolean') {
+          issues.push({ message: `tool-library-search: ${key} must be a boolean (got ${typeof raw})` })
+        }
+      }
+      if (record.fetch !== undefined && typeof record.fetch !== 'function') {
+        issues.push({ message: `tool-library-search: fetch must be a function (got ${typeof record.fetch})` })
+      }
+      if (record.embedder !== undefined) {
+        const embedder = record.embedder as { embed?: unknown }
+        if (typeof embedder !== 'object' || embedder === null || typeof embedder.embed !== 'function') {
+          issues.push({ message: 'tool-library-search: embedder must be an object with an `embed(texts)` function' })
+        }
+      }
+      if (issues.length > 0) return { issues }
+      return { value: record as unknown as LibrarySearchToolConfig }
+    },
+  },
+}
+
 /** One ranked candidate in the structured output. */
 interface OutputCandidate {
   readonly name: string
@@ -110,8 +195,9 @@ interface OutputCandidate {
 /** One fan-out source attempt in the structured output. */
 interface OutputSourceStatus {
   readonly id: string
-  readonly status: 'ok' | 'failed' | 'skipped'
+  readonly status: 'ok' | 'incomplete' | 'failed' | 'skipped'
   readonly hits: number
+  /** One-line reason when `status` is `failed` or `incomplete`. */
   readonly error?: string
 }
 
@@ -203,6 +289,13 @@ export function applyLibrarySearchTool(ctx: Context, config: LibrarySearchToolCo
     ...(config.fetch !== undefined ? { fetch: config.fetch } : {}),
     ...(config.githubToken !== undefined && config.githubToken.length > 0 ? { token: config.githubToken } : {}),
   }
+  // Lifetime owner (review round 2 finding 2): unloading must stop admission,
+  // cancel + drain accepted operations, then release the model. `owned` is
+  // aborted on dispose and fused with each call's exec.signal, so disposal
+  // cancels in-flight fetches even when the caller never aborted.
+  let disposed = false
+  const owned = new AbortController()
+  const inFlight = new Set<Promise<unknown>>()
 
   ctx.tools.register(defineLibrarySearchTool({
     name: 'library_search',
@@ -243,7 +336,10 @@ export function applyLibrarySearchTool(ctx: Context, config: LibrarySearchToolCo
     },
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const signal = exec.signal
+      if (disposed) {
+        throw new Error('tool-library-search: plugin is unloading; search not accepted')
+      }
+      const signal = exec.signal === undefined ? owned.signal : AbortSignal.any([exec.signal, owned.signal])
       const query = args.query.trim()
       if (query.length === 0) throw new Error('library_search: query must not be empty')
       if (args.maxResults !== undefined) {
@@ -265,7 +361,11 @@ export function applyLibrarySearchTool(ctx: Context, config: LibrarySearchToolCo
         text: '',
       }
       if (signal?.aborted) return abortedOutput
-      const result = await searchLibraries(query, { ...options, maxResults }, language, ecosystems)
+      // The search runs under the fused signal (exec + disposal): cancelling
+      // the TOOL CALL now reaches every source request (review round 2
+      // finding 1 — the signal was previously not forwarded at all).
+      const run = (async () => {
+        const result = await searchLibraries(query, { ...options, maxResults, signal }, language, ecosystems)
       if (signal?.aborted) return abortedOutput
       let candidates = result.candidates
       let semanticNote: string | undefined
@@ -311,6 +411,25 @@ export function applyLibrarySearchTool(ctx: Context, config: LibrarySearchToolCo
         text: renderResult(capped, query, language, semanticNote),
       }
       return output
+      })()
+      inFlight.add(run)
+      const settled = run.then(
+        value => { inFlight.delete(run); return value },
+        error => { inFlight.delete(run); throw error },
+      )
+      return settled
     },
   }))
+
+  // Unload sequence (in order): refuse new calls, abort in-flight fetches via
+  // `owned`, wait for accepted operations to settle, then release the model.
+  ctx.effect(
+    () => async () => {
+      disposed = true
+      owned.abort()
+      await Promise.allSettled([...inFlight])
+      await embedder.dispose?.()
+    },
+    'tool-library-search: drain in-flight searches and dispose embedder',
+  )
 }

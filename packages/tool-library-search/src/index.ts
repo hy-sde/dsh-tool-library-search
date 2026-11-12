@@ -13,6 +13,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-tools'
 import {
   applyLibrarySearchTool,
+  LIBRARY_SEARCH_CONFIG_SCHEMA,
   type LibrarySearchToolConfig,
 } from './tool.ts'
 import {
@@ -43,7 +44,11 @@ export type {
 export {
   applyLibrarySearchTool,
 } from './tool.ts'
+export {
+  LIBRARY_SEARCH_CONFIG_SCHEMA,
+} from './tool.ts'
 export type {
+  ConfigSchema,
   LibrarySearchToolConfig,
   ResolvedLibrarySearchToolConfig,
 } from './tool.ts'
@@ -98,5 +103,9 @@ export function apply(ctx: Context, config: LibrarySearchToolConfig = {}): void 
   })
 }
 
-/** Cordis plugin object for `@hy-sde-org/dsh-tool-library-search`. */
-export default { name, inject, apply }
+/**
+ * Cordis plugin object for `@hy-sde-org/dsh-tool-library-search`. `Config`
+ * carries the Standard Schema validator Cordis applies before the plugin
+ * starts — bad mounts (wrong types, unknown keys) fail the fiber loudly.
+ */
+export default { name, inject, apply, Config: LIBRARY_SEARCH_CONFIG_SCHEMA }
