@@ -12,7 +12,7 @@
  */
 
 import type { Candidate, Ecosystem } from '../candidates.ts'
-import { getJson, type SourceContext } from './http.ts'
+import { getJson, requireEnvelope, type SourceContext } from './http.ts'
 
 /** Whole set of names deps.dev search can surface. */
 const DEPSDEV_SYSTEM_TO_ECOSYSTEM: Readonly<Record<string, Ecosystem>> = {
@@ -39,11 +39,14 @@ interface DepsDevSearchResponse {
 
 /**
  * Run one deps.dev name search and normalize hits to candidates.
- * @throws {@link SourceHttpError} propagated from the transport layer.
+ * @throws {@link SourceHttpError} propagated from the transport layer, or
+ *   thrown when the response envelope is missing (the `_/search` endpoint
+ *   always returns a `results` array — its absence is a failure, not an
+ *   empty result).
  */
 export async function searchDepsDev(query: string, ctx: SourceContext, limit: number): Promise<Candidate[]> {
   const data = await getJson(`https://deps.dev/_/search?q=${encodeURIComponent(query)}`, ctx) as DepsDevSearchResponse
-  const results = data.results ?? []
+  const results = requireEnvelope(data, 'deps.dev', 'results').results as DepsDevResult[]
   const candidates: Candidate[] = []
   for (const result of results.slice(0, limit)) {
     if (result.kind === 'PROJECT') {

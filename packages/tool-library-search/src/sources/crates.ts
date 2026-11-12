@@ -6,7 +6,7 @@
  */
 
 import type { Candidate } from '../candidates.ts'
-import { getJson, type SourceContext } from './http.ts'
+import { getJson, requireEnvelope, type SourceContext } from './http.ts'
 
 interface Crate {
   readonly name?: string
@@ -23,15 +23,18 @@ interface CratesResponse {
 
 /**
  * Run one crates.io search and normalize hits to candidates.
- * @throws {SourceHttpError} propagated from the transport layer.
+ * @throws {SourceHttpError} propagated from the transport layer, or thrown
+ *   when the response envelope is missing (crates.io always returns a
+ *   `crates` array — its absence is a failure, not an empty result).
  */
 export async function searchCrates(query: string, ctx: SourceContext, limit: number): Promise<Candidate[]> {
   const data = await getJson(
     `https://crates.io/api/v1/crates?q=${encodeURIComponent(query)}&per_page=${limit}`,
     ctx,
   ) as CratesResponse
+  const crates = requireEnvelope(data, 'crates.io', 'crates').crates as Crate[]
   const candidates: Candidate[] = []
-  for (const crate of data.crates ?? []) {
+  for (const crate of crates) {
     if (crate.name === undefined) continue
     candidates.push({
       name: crate.name,

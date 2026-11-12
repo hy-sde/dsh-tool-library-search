@@ -16,7 +16,7 @@
  */
 
 import type { Candidate } from '../candidates.ts'
-import { getJson, type SourceContext } from './http.ts'
+import { getJson, requireEnvelope, type SourceContext } from './http.ts'
 
 interface GithubRepo {
   readonly full_name?: string
@@ -40,7 +40,9 @@ const DEFAULT_MAX_PAGES = 5
  * 10/min unauth budget on a single query).
  * @param limit - how many candidates to return (per-source cap).
  * @param maxPages - page ceiling; defaults to 1 without a token, 5 with one.
- * @throws {SourceHttpError} propagated from the transport layer.
+ * @throws {SourceHttpError} propagated from the transport layer, or thrown
+ *   when a page's `items` envelope is missing (GitHub always returns `items` —
+ *   its absence is a failure, not an empty result).
  */
 export async function searchGithub(
   query: string,
@@ -58,11 +60,12 @@ export async function searchGithub(
   const perPage = Math.min(Math.max(limit, 1), 100)
   const items: GithubRepo[] = []
   for (let page = 1; page <= pageCap; page++) {
+    if (ctx.signal?.aborted) break
     const data = await getJson(
       `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=${perPage}&page=${page}`,
       ctx,
     ) as GithubSearchResponse
-    const batch = data.items ?? []
+    const batch = requireEnvelope(data, 'github', 'items').items as GithubRepo[]
     items.push(...batch)
     if (items.length >= limit) break
     if (batch.length < perPage) break

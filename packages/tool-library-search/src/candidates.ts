@@ -68,9 +68,11 @@ export interface RankedCandidate extends Candidate {
 }
 
 /**
- * Collapse a name/query for equality: lowercase, strip everything but
- * alphanumerics. `serde_yaml`, `serde-yaml`, and `serdeyaml` all compare
- * equal, which is exactly the variation registries and repos use.
+ * Collapse a name/query for RELEVANCE scoring (exactness): lowercase, strip
+ * everything but alphanumerics. `serde_yaml`, `serde-yaml`, and `serdeyaml`
+ * all compare equal as relevance signals. Deliberately NOT used for identity:
+ * dedupeKey compares exact registry names, since `foobar` and `foo-bar` are
+ * genuinely different packages.
  */
 export function normCompact(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, '')
@@ -125,9 +127,17 @@ export function exactness(candidateName: string, query: string): number {
   return q.length >= 4 && n.includes(q) ? 1 : 0
 }
 
-/** Dedupe key: ecosystem + compact name (package and repo names both compare). */
+/**
+ * Dedupe key: identity, not similarity. Registry identities are EXACT —
+ * `foobar` and `foo-bar` are different npm packages with different pages, so
+ * merging them would render the wrong link under the winner's name (the
+ * compacted-equality bug from review claim 4). Only GitHub `owner/repo` names
+ * compare case-insensitively, because GitHub casing (e.g. `eemeli/YAML` vs
+ * `eemeli/yaml`) is presentation, not identity.
+ */
 export function dedupeKey(candidate: Candidate): string {
-  return `${candidate.ecosystem}:${normCompact(candidate.name)}`
+  const name = candidate.ecosystem === 'github' ? candidate.name.toLowerCase() : candidate.name
+  return `${candidate.ecosystem}:${name}`
 }
 
 /** Mutable accumulator for the merge pass. */

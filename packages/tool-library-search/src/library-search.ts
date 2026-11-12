@@ -1,10 +1,15 @@
 /**
  * The `library_search` core: fans one query out to the free sources
- * concurrently (deps.dev, npm, crates.io, GitHub), tolerates per-source
- * failures (only a total failure errors), merges, ranks with the exact-name
- * boost, and renders a markdown "does this already exist?" answer.
+ * concurrently (deps.dev, npm, crates.io, GitHub, pkg.go.dev), tolerates
+ * per-source failures (only a total failure errors), merges, ranks with the
+ * exact-name boost, and renders a markdown "does this already exist?" answer.
  *
- * The four sources were picked after a live probe (2026-09-06, queries
+ * Every source attempt is REPORTED — ok, failed, or skipped — so a partial
+ * search can never masquerade as a definitive "no match" (review claim 3).
+ * Ecosystem filters also skip sources that cannot answer the filtered
+ * ecosystems instead of spending requests on guaranteed-zero lanes.
+ *
+ * The sources were picked after a live probe (2026-09-06, queries
  * "yaml parser" / "markdown parser" / "serde_yaml"):
  * - npm: best free description search + downloads.
  * - GitHub repo search (qualifiers, stars): the semantic-ish leader; the only
@@ -12,6 +17,7 @@
  * - deps.dev: ONE call covering every ecosystem by NAME (the existence check;
  *   Maven/PyPI/Go have no usable free search, so deps.dev is their only lane).
  * - crates.io: cargo descriptions + downloads (needs a UA).
+ * - pkg.go.dev: Go module import counts (HTML scrape, tolerant by design).
  * - Excluded: libraries.io (key required), OpenLib (bot-protected), PyPI
  *   search (removed/challenged), Maven solrsearch (doesn't rank snakeyaml in
  *   top-30 of q=yaml), api.deps.dev/v3alpha/search (404).
@@ -47,13 +53,38 @@ export interface LibrarySearchOptions {
    * a README-relevant candidate that name-based ranking buried.
    */
   readonly poolSize?: number
+  /** External cancellation signal, forwarded to every source request. */
+  readonly signal?: AbortSignal
+}
+
+/** Outcome of one fan-out source attempt. */
+export interface SourceStatus {
+  /** Source id, as shown in failure lines (e.g. `deps.dev`). */
+  readonly id: string
+  /** ok = ran clean; failed = error (see `error`); skipped = not queried. */
+  readonly status: 'ok' | 'failed' | 'skipped'
+  /** Candidate hits the source contributed (0 when failed/skipped). */
+  readonly hits: number
+  /** One-line reason when `status` is `failed`. */
+  readonly error?: string
 }
 
 export interface LibrarySearchResult {
   readonly candidates: readonly Candidate[]
+  /** Per-source attempt ledger — the structured form of `failures`. */
+  readonly sources: readonly SourceStatus[]
   /** Which sources failed, with a one-line reason (informational). */
   readonly failures: readonly string[]
 }
+
+/** Which ecosystems each source can answer; `deps.dev` covers them all. */
+const SOURCE_ECOSYSTEMS = {
+  'deps.dev': 'all',
+  npm: ['npm'],
+  'crates.io': ['cargo'],
+  github: ['github'],
+  'pkg.go.dev': ['go'],
+} as const satisfies Readonly<Record<string, readonly Ecosystem[] | 'all'>>
 
 /** Render cap for candidate descriptions (GitHub repo descriptions are unvetted user text; one hostile repo can carry 50k+ chars and drown the answer). */
 export const MAX_DESCRIPTION_CHARS = 300
@@ -66,8 +97,11 @@ export function clipDescription(description: string): string {
 
 /**
  * Fan out to the free sources, merge, and rank. Per-source failures are
- * tolerated and reported; only when EVERY source fails does this throw.
+ * tolerated and reported (each becomes a `failed` {@link SourceStatus}); only
+ * when EVERY queried source fails does this throw. Sources whose ecosystem
+ * coverage cannot match the requested filter are skipped, not queried.
  * @param ecosystems - optional filter on result ecosystems (empty/undefined = all).
+ * @throws when every queried source failed, or the call was cancelled.
  */
 export async function searchLibraries(
   query: string,
@@ -75,6 +109,9 @@ export async function searchLibraries(
   language?: string,
   ecosystems?: readonly Ecosystem[],
 ): Promise<LibrarySearchResult> {
+  if (options.signal?.aborted) {
+    throw new Error('library search aborted before dispatch')
+  }
   const ctx: SourceContext = {
     timeoutMs: options.timeoutMs,
     userAgent: options.userAgent,
@@ -82,28 +119,44 @@ export async function searchLibraries(
     ...(options.githubToken !== undefined && options.githubToken.length > 0
       ? { token: options.githubToken }
       : {}),
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
   }
   const limit = Math.max(1, options.perSourceLimit)
-  const sources = [
-    { id: 'deps.dev', run: () => searchDepsDev(query, ctx, limit) },
-    { id: 'npm', run: () => searchNpm(query, ctx, limit) },
-    { id: 'crates.io', run: () => searchCrates(query, ctx, limit) },
-    { id: 'github', run: () => searchGithub(query, ctx, limit, language) },
-    { id: 'pkg.go.dev', run: () => searchPkgGoDev(query, ctx, limit) },
+  const ecosystemFilter = ecosystems !== undefined && ecosystems.length > 0 ? ecosystems : undefined
+  const specs = [
+    { id: 'deps.dev', ecosystems: SOURCE_ECOSYSTEMS['deps.dev'], run: () => searchDepsDev(query, ctx, limit) },
+    { id: 'npm', ecosystems: SOURCE_ECOSYSTEMS.npm, run: () => searchNpm(query, ctx, limit) },
+    { id: 'crates.io', ecosystems: SOURCE_ECOSYSTEMS['crates.io'], run: () => searchCrates(query, ctx, limit) },
+    { id: 'github', ecosystems: SOURCE_ECOSYSTEMS.github, run: () => searchGithub(query, ctx, limit, language) },
+    { id: 'pkg.go.dev', ecosystems: SOURCE_ECOSYSTEMS['pkg.go.dev'], run: () => searchPkgGoDev(query, ctx, limit) },
   ]
+  const statuses: SourceStatus[] = specs.map(spec => {
+    const relevant = ecosystemFilter === undefined
+      || spec.ecosystems === 'all'
+      || spec.ecosystems.some(ecosystem => ecosystemFilter.includes(ecosystem))
+    return { id: spec.id, status: relevant ? 'ok' : 'skipped', hits: 0 }
+  })
+  const byId = new Map(statuses.map(status => [status.id, status]))
 
-  const settled = await Promise.allSettled(sources.map(source => source.run()))
+  const active = specs.filter(spec => byId.get(spec.id)?.status === 'ok')
+  const settled = await Promise.allSettled(active.map(spec => spec.run()))
   const hits: Candidate[] = []
   const failures: string[] = []
   for (const [index, outcome] of settled.entries()) {
+    const status = byId.get(active[index]?.id ?? '')
+    if (status === undefined) continue
     if (outcome.status === 'fulfilled') {
       hits.push(...outcome.value)
+      statuses[statuses.indexOf(status)] = { ...status, status: 'ok', hits: outcome.value.length }
     } else {
       const reason = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
-      failures.push(`${sources[index]?.id ?? 'source'}: ${reason}`)
+      statuses[statuses.indexOf(status)] = { ...status, status: 'failed', hits: 0, error: reason }
+      failures.push(`${status.id}: ${reason}`)
     }
   }
-  if (hits.length === 0 && failures.length === sources.length) {
+  const queried = active.length
+  if (hits.length === 0 && failures.length === queried && queried > 0) {
+    if (options.signal?.aborted) throw new Error('library search aborted')
     throw new Error(`all library-search sources failed: ${failures.join('; ')}`)
   }
 
@@ -111,19 +164,23 @@ export async function searchLibraries(
     ? { ...hit, description: clipDescription(hit.description) }
     : hit)
   const merged = mergeCandidates(clipped)
-  const filtered = ecosystems !== undefined && ecosystems.length > 0
-    ? merged.filter(candidate => ecosystems.includes(candidate.ecosystem))
+  const filtered = ecosystemFilter !== undefined
+    ? merged.filter(candidate => ecosystemFilter.includes(candidate.ecosystem))
     : merged
   const ranked = rankCandidates(filtered, query)
   const poolSize = Math.max(options.poolSize ?? options.maxResults, options.maxResults)
-  return { candidates: ranked.slice(0, poolSize), failures }
+  return { candidates: ranked.slice(0, poolSize), sources: statuses, failures }
 }
 
 /** A stable default User-Agent; crates.io rejects bare `curl`-style clients. */
 export const LIBRARY_SEARCH_USER_AGENT =
   'library-search/0.1 (+https://github.com/hy-sde/dsh-tool-library-search)'
 
-/** Render ranked candidates as a compact markdown answer for the model. */
+/**
+ * Render ranked candidates as a compact markdown answer for the model.
+ * Failure disclosure is unconditional: a zero-candidate result WITH failures
+ * reads as an incomplete search, never as a definitive "nothing exists".
+ */
 export function renderResult(
   result: LibrarySearchResult,
   query: string,
@@ -132,7 +189,13 @@ export function renderResult(
 ): string {
   const lines: string[] = []
   if (result.candidates.length === 0) {
-    lines.push(`No existing package or repository matched \`${query}\` in the free sources.`)
+    if (result.failures.length > 0) {
+      lines.push(`No match for \`${query}\` — and the search was INCOMPLETE:`)
+      lines.push(`${result.failures.length} source(s) failed (${result.failures.join('; ')}).`)
+      lines.push('Results may be missing; retry or narrow the query before concluding nothing exists.')
+    } else {
+      lines.push(`No existing package or repository matched \`${query}\` in the free sources.`)
+    }
   } else {
     lines.push(`Existing implementations matching \`${query}\`${language ? ` (${language})` : ''}, ranked:`)
     for (const candidate of result.candidates) {

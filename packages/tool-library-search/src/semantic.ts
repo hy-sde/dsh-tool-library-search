@@ -31,6 +31,14 @@ export interface Embedder {
   readonly label: string
   /** Embed a batch of texts; returns one unit-ish vector per text. */
   embed(texts: readonly string[]): Promise<readonly (readonly number[])[]>
+  /**
+   * Fail fast when the embedder cannot run AT ALL (peer missing, model
+   * unloadable). Called by the rerank BEFORE any document fetching so an
+   * unavailable embedder is caught without paying for README traffic.
+   * Optional: stub embedders are always available.
+   * @throws when the embedder is unavailable.
+   */
+  probe?(): Promise<void>
 }
 
 /** Raised when semantic rerank is requested but no embedder is available. */
@@ -93,6 +101,9 @@ export async function rerankSemantic(
   embedder: Embedder,
   ctx: SourceContext,
 ): Promise<{ ranked: readonly (Candidate & { similarity: number })[]; usedReadmes: number; docsChecked: number }> {
+  // Probe FIRST: an embedder that cannot run (optional peer missing) must be
+  // detected before any README traffic is spent on its behalf.
+  await embedder.probe?.()
   const docs = await fetchCandidateDocuments(candidates, ctx)
   const texts = [query, ...docs.map(document => document.text)]
   const vectors = await embedder.embed(texts)
@@ -123,62 +134,67 @@ export async function rerankSemantic(
 /** Model used by {@link createLocalEmbedder} when none is configured. */
 export const DEFAULT_EMBEDDER_MODEL = 'Xenova/all-MiniLM-L6-v2'
 
-let localPipelinePromise: Promise<{
+/** The transformers.js feature-extraction pipeline surface this embedder uses. */
+interface LocalPipeline {
   extractor: (texts: string[], options: { pooling: string; normalize: boolean }) => Promise<{ tolist(): number[][] }>
-} | null> | null = null
+}
 
 /**
  * Create a local transformers.js embedder (all-MiniLM-L6-v2, quantized).
  * The `@huggingface/transformers` package is an OPTIONAL peer: it is
  * dynamically imported here, so the rest of the package works without it.
- * The first `embed()` call downloads/caches the model (~25 MB); subsequent
- * calls reuse the loaded pipeline.
+ *
+ * The pipeline is owned by THIS embedder instance (per-model memoized inside
+ * its closure) — a second embedder with a different model id loads its own
+ * model instead of silently reusing the first one (review claim 6). The first
+ * `embed()` call downloads/caches the model (~25 MB); subsequent calls reuse
+ * the loaded pipeline. Failed loads reset, so a later install can retry.
  * @param model - HF model id (default {@link DEFAULT_EMBEDDER_MODEL}).
- * @throws {@link SemanticUnavailableError} when the peer is not installed.
  */
 export function createLocalEmbedder(model: string = DEFAULT_EMBEDDER_MODEL): Embedder {
+  let pipelinePromise: Promise<LocalPipeline | null> | null = null
+  const load = async (): Promise<LocalPipeline | null> => {
+    if (pipelinePromise === null) {
+      pipelinePromise = (async () => {
+        try {
+          // Computed specifier: keeps the OPTIONAL peer out of static type
+          // resolution (it is not installed in base deployments) while still
+          // allowing a deployment that installed it to be picked up lazily.
+          const moduleName = '@huggingface/transformers'
+          const mod = await import(moduleName) as {
+            pipeline(task: string, model: string, options?: Record<string, unknown>): Promise<unknown>
+          }
+          const pipeline = mod.pipeline
+          return {
+            extractor: await pipeline('feature-extraction', model, { dtype: 'q8' }) as unknown as
+              LocalPipeline['extractor'],
+          }
+        } catch {
+          return null
+        }
+      })()
+    }
+    const result = await pipelinePromise
+    if (result === null) pipelinePromise = null // let a later install retry
+    return result
+  }
+  const unavailable = (): SemanticUnavailableError => new SemanticUnavailableError(
+    `semantic rerank unavailable: embedder ${model} could not load. `
+    + 'Install `@huggingface/transformers` alongside this package (optional peer) or disable `semantic` config.',
+  )
   return {
     label: `local:${model}`,
+    // Probe = load the pipeline now. Throws when the peer is missing so the
+    // caller degrades BEFORE fetching READMEs.
+    async probe(): Promise<void> {
+      const pipeline = await load()
+      if (pipeline === null) throw unavailable()
+    },
     async embed(texts: readonly string[]): Promise<readonly (readonly number[])[]> {
-      const pipeline = await loadLocalPipeline(model)
-      if (pipeline === null) {
-        throw new SemanticUnavailableError(
-          'semantic rerank unavailable: `@huggingface/transformers` is not installed. '
-          + 'Install it alongside this package (optional peer) or disable `semantic` config.',
-        )
-      }
+      const pipeline = await load()
+      if (pipeline === null) throw unavailable()
       const output = await pipeline.extractor([...texts], { pooling: 'mean', normalize: true })
       return output.tolist()
     },
   }
-}
-
-/** Load + memoize the transformers.js feature-extraction pipeline. */
-async function loadLocalPipeline(model: string): Promise<
-  { extractor: (texts: string[], options: { pooling: string; normalize: boolean }) => Promise<{ tolist(): number[][] }> } | null
-> {
-  if (localPipelinePromise === null) {
-    localPipelinePromise = (async () => {
-      try {
-        // Computed specifier: keeps the OPTIONAL peer out of static type
-        // resolution (it is not installed in base deployments) while still
-        // allowing a deployment that installed it to be picked up lazily.
-        const moduleName = '@huggingface/transformers'
-        const mod = await import(moduleName) as {
-          pipeline(task: string, model: string, options?: Record<string, unknown>): Promise<unknown>
-        }
-        const pipeline = mod.pipeline
-        return {
-          extractor: await pipeline('feature-extraction', model, { dtype: 'q8' }) as unknown as {
-            (texts: string[], options: { pooling: string; normalize: boolean }): Promise<{ tolist(): number[][] }>
-          },
-        }
-      } catch {
-        return null
-      }
-    })()
-  }
-  const result = await localPipelinePromise
-  if (result === null) localPipelinePromise = null // let a later install retry
-  return result
 }

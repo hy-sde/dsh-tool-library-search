@@ -13,18 +13,67 @@
  * `static.crates.io/readmes/...` which serves a bot-blocked AccessDenied to
  * non-browser clients (verified 2026-09-06), so we follow the `repository`
  * field to GitHub raw instead.
+ *
+ * Bodies are read as a STREAM with byte caps and cancelled past the cap: a
+ * pathological 200 KB README costs at most one bounded read, never a full
+ * buffer-then-slice (review claim 9).
  * @module @hy-sde-org/dsh-tool-library-search/readme
  */
 
 import type { Candidate } from './candidates.ts'
+import { composeAbortSignal, SourceHttpError } from './sources/http.ts'
 import type { Fetcher, SourceContext } from './sources/http.ts'
-import { SourceHttpError } from './sources/http.ts'
 
 /** Maximum characters retained from one README before embedding. */
 export const README_MAX_CHARS = 12_000
 
 /** Per-request timeout for README fetches (ms). */
 export const README_FETCH_TIMEOUT_MS = 6_000
+
+/** Byte cap on raw README bodies (≥ README_MAX_CHARS in any UTF-8 encoding). */
+export const README_MAX_BYTES = 64_000
+
+/**
+ * Byte cap on the npm registry JSON envelope before parsing (npm readmes can
+ * be large; the JSON wrapper adds metadata on top).
+ */
+export const README_JSON_MAX_BYTES = 256_000
+
+/** `owner/repo` slug extracted from a repository field. */
+export interface RepoSlug {
+  readonly owner: string
+  readonly repo: string
+}
+
+/**
+ * Extract the GitHub `owner/repo` slug from whatever shape a registry hands
+ * over. Handles `owner/repo` (deps.dev PROJECT entries), full https URLs with
+ * optional `.git`/fragment/path suffixes, `git+https://…`, `git://…`, and SCP
+ * form `git@github.com:owner/repo(.git)`. Non-GitHub hosts have no raw-README
+ * lane here and return undefined.
+ */
+export function parseRepositoryOwnerRepo(repository: string): RepoSlug | undefined {
+  const value = repository.trim()
+  if (value.length === 0) return undefined
+  // SCP form first: `git@github.com:owner/repo.git` is not a parseable URL.
+  const scp = /^git@github\.com:([^/\s#]+)\/([^/\s#]+?)(?:\.git)?(?:#.*)?$/i.exec(value)
+  if (scp !== null) return { owner: scp[1]!, repo: scp[2]! }
+  const urlCandidate = value.replace(/^git\+/i, '')
+  try {
+    const url = new URL(urlCandidate)
+    if (url.hostname !== 'github.com' && url.hostname !== 'www.github.com') return undefined
+    const segments = url.pathname.split('/').filter(segment => segment.length > 0)
+    const owner = segments[0]
+    const repo = segments[1]
+    if (owner === undefined || repo === undefined) return undefined
+    return { owner, repo: repo.replace(/\.git$/i, '') }
+  } catch {
+    // Bare `owner/repo` form (deps.dev PROJECT entries and some crates).
+    const bare = /^([^/\s#]+)\/([^/\s#]+?)(?:\.git)?(?:#.*)?$/.exec(value)
+    if (bare === null) return undefined
+    return { owner: bare[1]!, repo: bare[2]! }
+  }
+}
 
 /** One document ready for embedding. */
 export interface CandidateDocument {
@@ -48,9 +97,9 @@ export function readmeUrlsFor(candidate: Candidate): string[] {
   }
   const repository = candidate.repository
   if (repository === undefined || repository.length === 0) return []
-  const [owner, repo] = repository.split('/')
-  if (owner === undefined || repo === undefined) return []
-  const base = `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/HEAD/`
+  const slug = parseRepositoryOwnerRepo(repository)
+  if (slug === undefined) return []
+  const base = `https://raw.githubusercontent.com/${encodeURIComponent(slug.owner)}/${encodeURIComponent(slug.repo)}/HEAD/`
   return [`${base}README.md`, `${base}README.rst`]
 }
 
@@ -66,6 +115,7 @@ export async function fetchCandidateReadme(
   const urls = readmeUrlsFor(candidate)
   let lastError: unknown
   for (const url of urls) {
+    if (ctx.signal?.aborted) return undefined
     try {
       const text = await fetchText(url, ctx)
       if (text !== undefined) return text
@@ -77,33 +127,93 @@ export async function fetchCandidateReadme(
   return undefined
 }
 
-/** GET a URL as truncated text; npm JSON returns `readme`, raw returns the body. */
+/**
+ * Read a response body as a stream up to `maxBytes`, then stop (cancelling the
+ * stream). Honors the external cancellation signal: once aborted, no further
+ * chunks are pulled.
+ */
+async function readBodyCapped(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal | undefined,
+): Promise<{ text: string; truncated: boolean }> {
+  const body = response.body
+  if (body === null) return { text: '', truncated: false }
+  const reader = body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let bytes = 0
+  let text = ''
+  let truncated = false
+  try {
+    for (;;) {
+      if (signal?.aborted) {
+        truncated = true
+        break
+      }
+      const { done, value } = await reader.read()
+      if (done) break
+      bytes += value.byteLength
+      text += decoder.decode(value, { stream: true })
+      if (bytes >= maxBytes) {
+        truncated = true
+        break
+      }
+    }
+  } finally {
+    if (truncated) void reader.cancel().catch(() => {})
+    else void reader.cancel().catch(() => {}) // fully consumed; cancel is a no-op
+  }
+  if (!truncated) text += decoder.decode()
+  return { text, truncated }
+}
+
+/** GET a URL as capped text; npm JSON returns `readme`, raw returns the body. */
 async function fetchText(url: string, ctx: SourceContext): Promise<string | undefined> {
   const fetcher: Fetcher = ctx.fetch ?? globalThis.fetch.bind(globalThis)
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), README_FETCH_TIMEOUT_MS)
+  const signal = composeAbortSignal({
+    timeoutMs: README_FETCH_TIMEOUT_MS,
+    ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}),
+  })
   const headers: Record<string, string> = { 'User-Agent': ctx.userAgent, Accept: '*/*' }
   if (ctx.token !== undefined && ctx.token.length > 0 && url.includes('api.github.com')) {
     headers.Authorization = `Bearer ${ctx.token}`
   }
   try {
-    const response = await fetcher(url, { headers, signal: controller.signal })
+    const response = await fetcher(url, { headers, signal })
     if (!response.ok) throw new SourceHttpError(`HTTP ${response.status} for ${url}`, response.status)
     let text = ''
     if (url.includes('registry.npmjs.org')) {
-      const data = await response.json() as { readme?: string }
+      const { text: json } = await readBodyCapped(response, README_JSON_MAX_BYTES, ctx.signal)
+      let data: { readme?: string }
+      try {
+        data = JSON.parse(json) as { readme?: string }
+      } catch {
+        throw new SourceHttpError(`npm: malformed readme JSON for ${url}`)
+      }
       text = data.readme ?? ''
     } else {
-      text = await response.text()
+      const { text: raw } = await readBodyCapped(response, README_MAX_BYTES, ctx.signal)
+      text = raw
     }
     if (text.length === 0) return undefined
     return text.length > README_MAX_CHARS ? text.slice(0, README_MAX_CHARS) : text
   } catch (error) {
     if (error instanceof SourceHttpError) throw error
+    if (ctx.signal?.aborted) throw new SourceHttpError(`aborted for ${url}`)
     const message = error instanceof Error ? error.message : String(error)
     throw new SourceHttpError(`fetch failed for ${url}: ${message}`)
-  } finally {
-    clearTimeout(timer)
+  }
+}
+
+/** The description-only document a candidate falls back to. */
+function documentFor(candidate: Candidate, readme: string | undefined): CandidateDocument {
+  const parts: string[] = []
+  if (candidate.description !== undefined) parts.push(candidate.description)
+  if (readme !== undefined) parts.push(readme)
+  return {
+    key: `${candidate.ecosystem}:${candidate.name.toLowerCase()}`,
+    text: parts.join('\n\n'),
+    hasReadme: readme !== undefined,
   }
 }
 
@@ -111,8 +221,10 @@ async function fetchText(url: string, ctx: SourceContext): Promise<string | unde
  * Fetch READMEs for a batch with bounded concurrency. Individual failures and
  * missing READMEs never throw: they yield a description-only document. All
  * candidates get a document, so the rerank always has something to embed.
+ * When the context signal is already aborted, remaining candidates skip the
+ * network entirely and fall back to description-only documents.
  * @param candidates - the rerank pool.
- * @param ctx - source context (UA/timeout/fetch seam).
+ * @param ctx - source context (UA/timeout/fetch seam, cancellation signal).
  * @param concurrency - max in-flight fetches (default 6).
  */
 export async function fetchCandidateDocuments(
@@ -129,15 +241,12 @@ export async function fetchCandidateDocuments(
       if (index >= candidates.length) return
       const candidate = candidates[index]
       if (candidate === undefined) return
-      const readme = await fetchCandidateReadme(candidate, ctx).catch(() => undefined)
-      const parts: string[] = []
-      if (candidate.description !== undefined) parts.push(candidate.description)
-      if (readme !== undefined) parts.push(readme)
-      docs[index] = {
-        key: `${candidate.ecosystem}:${candidate.name.toLowerCase()}`,
-        text: parts.join('\n\n'),
-        hasReadme: readme !== undefined,
-      }
+      // Cancellation stops ADMISSION of new network work; in-flight requests
+      // abort via their fused signal and the pool settles quiescently.
+      const readme = ctx.signal?.aborted
+        ? undefined
+        : await fetchCandidateReadme(candidate, ctx).catch(() => undefined)
+      docs[index] = documentFor(candidate, readme)
     }
   }
   const workerCount = Math.max(1, Math.min(concurrency, candidates.length))

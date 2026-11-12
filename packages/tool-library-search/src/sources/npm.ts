@@ -6,7 +6,7 @@
  */
 
 import type { Candidate } from '../candidates.ts'
-import { getJson, type SourceContext } from './http.ts'
+import { getJson, requireEnvelope, type SourceContext } from './http.ts'
 
 interface NpmSearchObject {
   readonly package?: {
@@ -24,15 +24,19 @@ interface NpmSearchResponse {
 
 /**
  * Run one npm registry search and normalize hits to candidates.
- * @throws {SourceHttpError} propagated from the transport layer.
+ * @throws {SourceHttpError} propagated from the transport layer, or thrown
+ *   when the response envelope is missing (the registry always returns an
+ *   `objects` array, even for zero results — its absence is a failure, not
+ *   an empty result).
  */
 export async function searchNpm(query: string, ctx: SourceContext, limit: number): Promise<Candidate[]> {
   const data = await getJson(
     `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(query)}&size=${limit}`,
     ctx,
   ) as NpmSearchResponse
+  const objects = requireEnvelope(data, 'npm', 'objects').objects as NpmSearchObject[]
   const candidates: Candidate[] = []
-  for (const object of data.objects ?? []) {
+  for (const object of objects) {
     const pkg = object.package
     if (pkg?.name === undefined) continue
     const link = normalizeLink(pkg.links?.repository ?? pkg.links?.homepage ?? `https://www.npmjs.com/package/${pkg.name}`)
