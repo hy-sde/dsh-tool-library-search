@@ -69,22 +69,27 @@ describe('searchLibraries', () => {
     await expect(searchLibraries('x', { ...OPTIONS, fetch: fetchAllFail })).rejects.toThrow(/all library-search sources failed/)
   })
 
-  it('filters by ecosystem', async () => {
+  it('filters by ecosystem and skips out-of-scope sources', async () => {
     const result = await searchLibraries('yaml', OPTIONS, undefined, ['npm', 'github'])
     expect(result.candidates.length).toBeGreaterThan(0)
     expect(result.candidates.every(c => c.ecosystem === 'npm' || c.ecosystem === 'github')).toBe(true)
+    const skipped = result.sources.filter(s => s.status === 'skipped').map(s => s.id)
+    expect(skipped).toEqual(expect.arrayContaining(['crates.io', 'pkg.go.dev']))
+    expect(result.sources.find(s => s.id === 'npm')?.status).toBe('ok')
+    expect(result.sources.find(s => s.id === 'deps.dev')?.status).toBe('ok')
   })
 })
 
 describe('renderResult', () => {
   it('renders empty result as a clear no-match line', () => {
-    const text = renderResult({ candidates: [], failures: [] }, 'xyzzy')
+    const text = renderResult({ candidates: [], sources: [], failures: [] }, 'xyzzy')
     expect(text).toContain('No existing package or repository')
   })
 
   it('renders candidates with ecosystem, stars, downloads', () => {
     const text = renderResult({
       candidates: [FAKE('yaml', 'npm', { downloads: 1_000_000, description: 'parser' }), FAKE('eemeli/yaml', 'github', { stars: 1688 })],
+      sources: [],
       failures: [],
     }, 'yaml')
     expect(text).toContain('1.0M/mo')
