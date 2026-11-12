@@ -42,6 +42,9 @@ const OPTIONS = {
     '-/v1/search': () => ({ objects: [{ package: { name: 'yaml', version: '2.9.0', description: 'YAML parser' }, downloads: { monthly: 100 } }] }),
     'crates.io/api/v1/crates': () => ({ crates: [{ name: 'serde_yaml', max_version: '0.9.34', description: 'YAML', recent_downloads: 50 }] }),
     'api.github.com': () => ({ items: [{ full_name: 'eemeli/yaml', html_url: 'u', description: 'repo', stargazers_count: 1688 }] }),
+    // Genuine no-results page (marker HTML) so pkg.go.dev reports ok-empty
+    // instead of the new unrecognized-page incomplete classification.
+    'pkg.go.dev': () => '<p class="gopher-message">It looks like there are no matches for your search.</p>',
   }),
 }
 

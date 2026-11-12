@@ -17,13 +17,23 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
+import { Context, ValidationError } from '@deepseek-ai/cordis'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { mergeCandidates, rankCandidates } from '../src/candidates.ts'
 import type { Candidate } from '../src/candidates.ts'
 import { renderResult, searchLibraries } from '../src/library-search.ts'
 import { fetchCandidateReadme, readmeUrlsFor } from '../src/readme.ts'
 import { applyLibrarySearchTool } from '../src/tool.ts'
+import type { LibrarySearchToolConfig } from '../src/tool.ts'
 import { apply, LIBRARY_SEARCH_PROMPT_TEXT } from '../src/index.ts'
+import pluginObject from '../src/index.ts'
 import { buildLibrarySearchPromptSection } from '../src/prompt.ts'
+import { searchGithub } from '../src/sources/github.ts'
+import { searchPkgGoDev } from '../src/sources/pkggodev.ts'
+import { readBodyCapped, type Fetcher } from '../src/sources/http.ts'
 
 const CTX = { timeoutMs: 500, userAgent: 'probe', maxResults: 5, perSourceLimit: 3 }
 
@@ -39,9 +49,19 @@ interface CapturedTool {
   output?: { presentationMeta?: (args: unknown, value: unknown) => unknown }
 }
 
-function captureTool(config: Parameters<typeof applyLibrarySearchTool>[1]): CapturedTool {
+function captureTool(
+  config: Parameters<typeof applyLibrarySearchTool>[1],
+  disposers: Array<() => unknown> = [],
+): CapturedTool {
   let captured: CapturedTool | undefined
-  const ctx = { tools: { register: (def: never) => { captured = def as unknown as CapturedTool } } }
+  const ctx = {
+    tools: { register: (def: never) => { captured = def as unknown as CapturedTool } },
+    effect: (execute: () => unknown) => {
+      const disposer = execute()
+      disposers.push(disposer as () => unknown)
+      return disposer
+    },
+  }
   applyLibrarySearchTool(ctx as never, config)
   if (captured === undefined) throw new Error('tool never registered')
   return captured
@@ -71,9 +91,14 @@ const FAKE = (name: string, ecosystem: Candidate['ecosystem'], extra: Partial<Ca
   link: `https://example.com/${name}`, sources: ['test'], ...extra,
 })
 
+/** What pkg.go.dev really serves for a query with zero hits (live probe). */
+const NO_RESULTS_PAGE = '<p class="gopher-message">It looks like there are no matches for your search.</p>'
+
 describe('claim 1: GitHub token is scoped to api.github.com', () => {
   it('never sends the token to deps.dev, npm, crates.io, or pkg.go.dev', async () => {
-    const { seen, fetch } = stubFetch([])
+    const { seen, fetch } = stubFetch([
+      { match: u => u.includes('pkg.go.dev'), body: NO_RESULTS_PAGE },
+    ])
     await searchLibraries('yaml', { ...CTX, githubToken: 'ghp_SECRET', fetch })
     const authedUrls = seen.filter(s => s.headers.Authorization !== undefined).map(s => s.url)
     expect(authedUrls.length).toBeGreaterThan(0)
@@ -114,9 +139,13 @@ describe('claim 2: cancellation is observed', () => {
 
 describe('claim 3: empty is distinguished from failed', () => {
   it('malformed source responses surface as failures with a per-source ledger', async () => {
-    // Every JSON source unrouted → default `{}` → malformed envelope. Only
-    // pkg.go.dev is tolerant-by-design, so the call must NOT throw.
-    const { fetch } = stubFetch([{ match: u => u.includes('registry.npmjs.org'), body: { oops: true } }])
+    // Every JSON source either unrouted (→ default `{}` → malformed envelope)
+    // or explicitly malformed; pkg.go.dev is routed to a GENUINE no-results
+    // page (marker HTML), so the call must NOT throw.
+    const { fetch } = stubFetch([
+      { match: u => u.includes('registry.npmjs.org'), body: { oops: true } },
+      { match: u => u.includes('pkg.go.dev'), body: NO_RESULTS_PAGE },
+    ])
     const result = await searchLibraries('yaml', { ...CTX, fetch })
     expect(result.candidates).toHaveLength(0)
     expect(result.failures.length).toBeGreaterThanOrEqual(4)
@@ -181,7 +210,12 @@ describe('claim 6: embedder state and probing', () => {
     vi.doMock('@huggingface/transformers', () => ({
       pipeline: async (_task: string, model: string) => {
         loadedModels.push(model)
-        return async (texts: string[]) => ({ tolist: () => texts.map(() => [1, 0]) })
+        // The real pipeline object carries `extractor` (and `dispose`, which
+        // the unload path now awaits).
+        return {
+          extractor: async (texts: string[]) => ({ tolist: () => texts.map(() => [1, 0]) }),
+          dispose: async (): Promise<void> => {},
+        }
       },
     }))
     const { createLocalEmbedder } = await import('../src/semantic.ts')
@@ -213,6 +247,7 @@ describe('claim 7: structured output', () => {
     { match: u => u.includes('deps.dev'), body: { results: [] } },
     { match: u => u.includes('crates.io'), body: { crates: [] } },
     { match: u => u.includes('api.github.com'), body: { items: [] } },
+    { match: u => u.includes('pkg.go.dev'), body: NO_RESULTS_PAGE },
   ])
 
   it('execute returns typed candidates + source ledger + markdown text', async () => {
@@ -315,6 +350,7 @@ describe('claim 10: prompt section is concise, visible, and toggleable', () => {
     let visible = true
     let section: { name: string; text: (context: unknown) => string } | undefined
     const ctx = {
+      effect: (execute: () => unknown) => execute(),
       tools: {
         register: (def: never) => { registered = def },
         get: () => (visible ? registered : undefined),
@@ -332,6 +368,7 @@ describe('claim 10: prompt section is concise, visible, and toggleable', () => {
     let registered: unknown
     let section: { text: (context: unknown) => string } | undefined
     const ctx = {
+      effect: (execute: () => unknown) => execute(),
       tools: {
         register: (def: never) => { registered = def },
         get: () => registered,
@@ -340,5 +377,213 @@ describe('claim 10: prompt section is concise, visible, and toggleable', () => {
     }
     apply(ctx as never, { prompt: false })
     expect(section?.text({})).toBe('')
+  })
+})
+
+describe('round 2: cancellation propagates through every stage', () => {
+  it('searchLibraries with a mid-search abort rejects instead of resolving partial results', async () => {
+    const ac = new AbortController()
+    const fetch: Fetcher = (_url, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')), { once: true })
+    })
+    const run = searchLibraries('yaml', { ...CTX, fetch, signal: ac.signal })
+    const assertion = expect(run).rejects.toThrow(/aborted/)
+    setTimeout(() => ac.abort(), 5)
+    await assertion
+  })
+
+  it('searchGithub abort after a successful page rejects — earlier pages are not passed off as success', async () => {
+    const ac = new AbortController()
+    let page = 0
+    const fetch: Fetcher = async (_url, init) => {
+      page += 1
+      if (page === 1) {
+        const items = Array.from({ length: 100 }, (_, i) => ({ full_name: `org/repo-${i}` }))
+        return new Response(JSON.stringify({ items }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')), { once: true })
+      })
+    }
+    // A token is required to page at all: unauthenticated GitHub search stops after page 1.
+    const run = searchGithub('yaml', { ...CTX, token: 'stub-token', fetch, signal: ac.signal }, 200)
+    const assertion = expect(run).rejects.toThrow(/aborted/)
+    setTimeout(() => ac.abort(), 5)
+    await assertion
+  })
+})
+
+describe('round 2: item-level validation keeps malformed items inside their source', () => {
+  it('a nameless deps.dev item fails only deps.dev — npm candidates still survive', async () => {
+    const { fetch } = stubFetch([
+      { match: u => u.includes('deps.dev'), body: { results: [{ kind: 'PACKAGE', system: 'NPM' }] } },
+      { match: u => u.includes('registry.npmjs.org'), body: npmBody(['yaml']) },
+      { match: u => u.includes('crates.io'), body: { crates: [] } },
+      { match: u => u.includes('api.github.com'), body: { items: [] } },
+      { match: u => u.includes('pkg.go.dev'), body: NO_RESULTS_PAGE },
+    ])
+    const result = await searchLibraries('yaml', { ...CTX, fetch })
+    expect(result.candidates.map(candidate => candidate.name)).toContain('yaml')
+    expect(result.sources.find(source => source.id === 'deps.dev')?.status).toBe('failed')
+    expect(result.failures.join('\n')).toContain('deps.dev')
+  })
+})
+
+describe('round 2: upstream incompleteness is preserved', () => {
+  it('github incomplete_results marks the source incomplete instead of ok-empty', async () => {
+    const { fetch } = stubFetch([
+      { match: u => u.includes('api.github.com'), body: { items: [], incomplete_results: true } },
+      { match: u => u.includes('registry.npmjs.org'), body: npmBody(['yaml']) },
+      { match: u => u.includes('crates.io'), body: { crates: [] } },
+      { match: u => u.includes('deps.dev'), body: { results: [] } },
+      { match: u => u.includes('pkg.go.dev'), body: NO_RESULTS_PAGE },
+    ])
+    const result = await searchLibraries('yaml', { ...CTX, fetch })
+    expect(result.candidates.map(candidate => candidate.name)).toContain('yaml')
+    expect(result.sources.find(source => source.id === 'github')?.status).toBe('incomplete')
+    expect(result.failures.join('\n')).toContain('github')
+  })
+
+  it('tool render: incomplete upstream marks the search complete:false with INCOMPLETE wording', async () => {
+    const { fetch } = stubFetch([
+      { match: u => u.includes('api.github.com'), body: { items: [], incomplete_results: true } },
+      { match: u => u.includes('registry.npmjs.org'), body: { objects: [] } },
+      { match: u => u.includes('crates.io'), body: { crates: [] } },
+      { match: u => u.includes('deps.dev'), body: { results: [] } },
+      { match: u => u.includes('pkg.go.dev'), body: NO_RESULTS_PAGE },
+    ])
+    const tool = captureTool({ ...CTX, fetch })
+    const value = await tool.execute({ query: 'yaml' }, {})
+    expect(value.complete).toBe(false)
+    expect(value.sources?.find(source => source.id === 'github')?.status).toBe('incomplete')
+    expect(value.text).toContain('INCOMPLETE')
+  })
+
+  it('pkg.go.dev: explicit no-results page stays ok-empty; shape drift is incomplete', async () => {
+    const html = (body: string): Fetcher => async () =>
+      new Response(body, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+    await expect(searchPkgGoDev('yaml', { ...CTX, fetch: html(NO_RESULTS_PAGE) }, 8)).resolves.toEqual([])
+    await expect(searchPkgGoDev('yaml', { ...CTX, fetch: html('<div class="SearchSnippet" ><span>broken</span></div>') }, 8))
+      .rejects.toThrow(/search page changed shape/)
+    await expect(searchPkgGoDev('yaml', { ...CTX, fetch: html('<html><body>maintenance</body></html>') }, 8))
+      .rejects.toThrow(/unrecognized search page/)
+  })
+})
+
+describe('round 2: stream bounds and cancellation await', () => {
+  it('readBodyCapped stops pulling past the cap and awaits reader.cancel()', async () => {
+    let cancelSettled = false
+    let pulls = 0
+    let enqueued = 0
+    const chunk = new TextEncoder().encode('y'.repeat(50_000))
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1
+        enqueued += chunk.length
+        controller.enqueue(chunk)
+      },
+      cancel() {
+        return new Promise<void>(resolve => setTimeout(() => { cancelSettled = true; resolve() }, 5))
+      },
+    })
+    const { text, truncated } = await readBodyCapped(new Response(stream), 64_000, undefined)
+    expect(truncated).toBe(true)
+    expect(text.length).toBe(64_000)
+    expect(pulls).toBeLessThanOrEqual(4)
+    expect(enqueued).toBeLessThanOrEqual(200_000)
+    expect(cancelSettled).toBe(true)
+  })
+})
+
+describe('round 2: plugin lifetime', () => {
+  it('execute refuses new calls once disposal has begun', async () => {
+    const disposers: Array<() => unknown> = []
+    const tool = captureTool({ ...CTX, fetch: async (): Promise<Response> => new Promise<Response>(() => {}) }, disposers)
+    expect(disposers).toHaveLength(1)
+    await (disposers[0] as () => Promise<void>)()
+    await expect(tool.execute({ query: 'x' }, { signal: new AbortController().signal }))
+      .rejects.toThrow(/unloading; search not accepted/)
+  })
+
+  it('unload drains in-flight searches before releasing the embedder (real cordis ctx)', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
+    const events: string[] = []
+    let openGate: (() => void) | undefined
+    const gate = new Promise<void>(resolve => { openGate = resolve })
+    const fetch: Fetcher = async () => {
+      await gate
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    const embedder = {
+      label: 'stub',
+      embed: async (): Promise<number[][]> => { throw new Error('no embed in this test') },
+      dispose: async (): Promise<void> => { events.push('embedder-disposed') },
+    }
+    applyLibrarySearchTool(ctx, { ...CTX, fetch, embedder })
+    void ctx.tools.execute({
+      calls: [{
+        type: 'tool-call' as const,
+        id: ToolCallId('r2-drain'),
+        name: 'library_search',
+        arguments: JSON.stringify({ query: 'yaml' }),
+      }],
+      signal: new AbortController().signal,
+      agent: { session: { header: { id: 'r2-drain', cwd: '' } } } as never,
+    }).catch(() => {})
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const disposal = ctx.fiber.dispose()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(events).toEqual([]) // model still held: the search is in flight
+    openGate?.()
+    await disposal
+    expect(events).toEqual(['embedder-disposed']) // released only after the drain completed
+  })
+
+  it('after dispose, the next embed loads a fresh pipeline (model released, API preserved)', async () => {
+    const loadedModels: string[] = []
+    const disposedPipelines: string[] = []
+    vi.doMock('@huggingface/transformers', () => ({
+      pipeline: async (_task: string, model: string) => {
+        loadedModels.push(model)
+        return {
+          extractor: async (texts: string[]) => ({ tolist: () => texts.map(() => [1, 0]) }),
+          dispose: async (): Promise<void> => { disposedPipelines.push(model) },
+        }
+      },
+    }))
+    const { createLocalEmbedder } = await import('../src/semantic.ts')
+    const embedder = createLocalEmbedder('modelA')
+    await embedder.embed(['first'])
+    expect(loadedModels).toEqual(['modelA'])
+    await embedder.dispose?.()
+    expect(disposedPipelines).toEqual(['modelA'])
+    await embedder.embed(['second']) // reloads a fresh pipeline after dispose
+    expect(loadedModels).toEqual(['modelA', 'modelA'])
+    vi.doUnmock('@huggingface/transformers')
+  })
+})
+
+describe('round 2: cordis config schema', () => {
+  const mount = async (config: unknown): Promise<Context> => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    // Deliberately ill-typed configs are the point of the rejection tests.
+    await ctx.plugin(pluginObject, config as LibrarySearchToolConfig)
+    return ctx
+  }
+  it('rejects wrong-typed and unknown keys before apply ever runs', async () => {
+    await expect(mount({ semantic: 'true' })).rejects.toThrow(ValidationError)
+    await expect(mount({ prompt: 'false' })).rejects.toThrow(ValidationError)
+    await expect(mount({ githubToken: 42 })).rejects.toThrow(ValidationError)
+    await expect(mount({ timeoutMs: 'fast' })).rejects.toThrow(ValidationError)
+    await expect(mount({ mystery: 1 })).rejects.toThrow(ValidationError)
+  })
+  it('accepts a well-typed config and mounts cleanly', async () => {
+    const ctx = await mount({ semantic: true, prompt: false, timeoutMs: 1_000, maxResults: 3 })
+    await ctx.fiber.dispose()
   })
 })
