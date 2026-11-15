@@ -56,7 +56,7 @@ agent-plane row like the harness's own tool rows and consumes the stock
 - Node.js 22.19 or newer (the package's `engines` floor) with npm and pnpm on `PATH`;
 - a DeepSeek Harness installation including the standard `dsh` CLI — the peer baseline
   is `@deepseek-ai/cordis ~4.1.0` and
-  `@deepseek-ai/dsh-tools`/`@deepseek-ai/dsh-system-prompt` `^0.2.2-rc.1`;
+  `@deepseek-ai/dsh-tools`/`@deepseek-ai/dsh-system-prompt` `^0.2.2-rc.3`;
 - no API key — the registry sources are free and anonymous. The optional semantic rerank
   peer `@huggingface/transformers` (`>=3.7.1 <5`) downloads ~25 MB of model weights
   once; without it the tool answers with lexical ranking and notes the rerank was
